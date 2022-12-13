@@ -1,5 +1,5 @@
 use convert_case::{Case, Casing};
-use quick_xml::events::Event;
+use quick_xml::events::{attributes::Attribute, Event};
 use quick_xml::Reader;
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -11,16 +11,17 @@ pub enum ParseError {
     NonUTF8,
     WriteError,
     UnexpectedValue,
+    MissingBasePeripheral(String),
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Field {
     name: String,
     lsb: usize,
     msb: usize,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Register {
     name: String,
     offset: usize,
@@ -28,7 +29,7 @@ pub struct Register {
     fields: Vec<Field>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Interrupt {
     name: String,
     value: usize,
@@ -73,6 +74,7 @@ impl core::fmt::Display for ParseError {
             ParseIntError => write!(f, "unable to parse number"),
             NonUTF8 => write!(f, "file is not UTF-8"),
             WriteError => write!(f, "unable to write destination file"),
+            MissingBasePeripheral(ref name) => write!(f, "undeclared base peripheral: {}", name),
         }
     }
 }
@@ -119,6 +121,9 @@ fn generate_field<T: BufRead>(reader: &mut Reader<T>) -> Result<Field, ParseErro
     let mut name = None;
     let mut lsb = None;
     let mut msb = None;
+    let mut bit_offset = None;
+    let mut bit_width = None;
+
     loop {
         match reader.read_event(&mut buf) {
             Ok(Event::Start(ref e)) => {
@@ -131,15 +136,31 @@ fn generate_field<T: BufRead>(reader: &mut Reader<T>) -> Result<Field, ParseErro
                     "msb" => msb = Some(parse_usize(extract_contents(reader)?.as_bytes())?),
                     "bitRange" => {
                         let range = extract_contents(reader)?;
-                        if !range.starts_with("[") || !range.ends_with("]") {
-                            return Err(ParseError::UnexpectedValue)
+                        if !range.starts_with('[') || !range.ends_with(']') {
+                            return Err(ParseError::UnexpectedValue);
                         }
 
                         let mut parts = range[1..range.len() - 1].split(':');
-                        msb = Some(parts.next().ok_or_else(|| ParseError::UnexpectedValue)?
-                            .parse::<usize>().or_else(|_| Err(ParseError::ParseIntError))?);
-                        lsb = Some(parts.next().ok_or_else(|| ParseError::UnexpectedValue)?
-                            .parse::<usize>().or_else(|_| Err(ParseError::ParseIntError))?);
+                        msb = Some(
+                            parts
+                                .next()
+                                .ok_or(ParseError::UnexpectedValue)?
+                                .parse::<usize>()
+                                .map_err(|_| ParseError::ParseIntError)?,
+                        );
+                        lsb = Some(
+                            parts
+                                .next()
+                                .ok_or(ParseError::UnexpectedValue)?
+                                .parse::<usize>()
+                                .map_err(|_| ParseError::ParseIntError)?,
+                        );
+                    }
+                    "bitWidth" => {
+                        bit_width = Some(parse_usize(extract_contents(reader)?.as_bytes())?)
+                    }
+                    "bitOffset" => {
+                        bit_offset = Some(parse_usize(extract_contents(reader)?.as_bytes())?)
                     }
                     _ => (),
                 }
@@ -151,6 +172,16 @@ fn generate_field<T: BufRead>(reader: &mut Reader<T>) -> Result<Field, ParseErro
             }
             Ok(_) => (),
             Err(e) => panic!("error parsing: {:?}", e),
+        }
+    }
+
+    // If no msb/lsb and bitRange tags were encountered then
+    // it's possible that the field is defined via
+    // `bitWidth` and `bitOffset` tags instead. Let's handle this.
+    if lsb.is_none() && msb.is_none() {
+        if let (Some(bit_width), Some(bit_offset)) = (bit_width, bit_offset) {
+            lsb = Some(bit_offset);
+            msb = Some(bit_offset + bit_width - 1);
         }
     }
 
@@ -286,13 +317,27 @@ fn generate_registers<T: BufRead>(
     Ok(())
 }
 
-fn generate_peripheral<T: BufRead>(reader: &mut Reader<T>) -> Result<Peripheral, ParseError> {
+fn derive_peripheral(base: &Peripheral, child_name: &str, child_base: usize) -> Peripheral {
+    Peripheral {
+        name: child_name.to_owned(),
+        base: child_base,
+        _size: base._size,
+        interrupt: base.interrupt.clone(),
+        registers: base.registers.clone(),
+    }
+}
+
+fn generate_peripheral<T: BufRead>(
+    base_peripheral: Option<&Peripheral>,
+    reader: &mut Reader<T>,
+) -> Result<Peripheral, ParseError> {
     let mut buf = Vec::new();
     let mut name = None;
     let mut base = None;
     let mut size = None;
     let mut registers = vec![];
     let mut interrupts = vec![];
+
     loop {
         match reader.read_event(&mut buf) {
             Ok(Event::Start(ref e)) => {
@@ -320,22 +365,48 @@ fn generate_peripheral<T: BufRead>(reader: &mut Reader<T>) -> Result<Peripheral,
         }
     }
 
-    Ok(Peripheral {
-        name: name.ok_or(ParseError::MissingValue)?,
-        base: base.ok_or(ParseError::MissingValue)?,
-        _size: size.ok_or(ParseError::MissingValue)?,
-        interrupt: interrupts,
-        registers,
-    })
+    let name = name.ok_or(ParseError::MissingValue)?;
+    let base = base.ok_or(ParseError::MissingValue)?;
+
+    // Derive from the base peripheral if specified
+    if let Some(base_peripheral) = base_peripheral {
+        Ok(derive_peripheral(base_peripheral, &name, base))
+    } else {
+        Ok(Peripheral {
+            name,
+            base,
+            _size: size.ok_or(ParseError::MissingValue)?,
+            interrupt: interrupts,
+            registers,
+        })
+    }
 }
 
 fn generate_peripherals<T: BufRead>(reader: &mut Reader<T>) -> Result<Vec<Peripheral>, ParseError> {
     let mut buf = Vec::new();
-    let mut peripherals = vec![];
+    let mut peripherals: Vec<Peripheral> = vec![];
+
     loop {
         match reader.read_event(&mut buf) {
             Ok(Event::Start(ref e)) => match e.name() {
-                b"peripheral" => peripherals.push(generate_peripheral(reader)?),
+                b"peripheral" => {
+                    let base_peripheral = match e.attributes().next() {
+                        Some(Ok(Attribute { key, value })) if key == b"derivedFrom" => {
+                            let base_peripheral_name = String::from_utf8(value.to_vec())
+                                .map_err(|_| ParseError::NonUTF8)?;
+
+                            let base = peripherals
+                                .iter()
+                                .find(|p| p.name == base_peripheral_name)
+                                .ok_or(ParseError::MissingBasePeripheral(base_peripheral_name))?;
+
+                            Some(base)
+                        }
+                        _ => None,
+                    };
+
+                    peripherals.push(generate_peripheral(base_peripheral, reader)?);
+                }
                 _ => panic!("unexpected tag in <peripherals>: {:?}", e),
             },
             Ok(Event::End(ref e)) => match e.name() {
@@ -900,16 +971,25 @@ fn print_tests<U: Write>(peripherals: &[Peripheral], out: &mut U) -> std::io::Re
     let test_header = r####"
 #[cfg(test)]
 mod tests {
-    #[test]
-    #[ignore]
-    fn compile_check() {
-        use super::*;
 "####
         .as_bytes();
     out.write_all(test_header)?;
+
     for peripheral in peripherals {
         let mod_name = peripheral.name.to_lowercase();
         let per_name = peripheral.name.to_lowercase() + "_csr";
+
+        write!(
+            out,
+            r####"
+    #[test]
+    #[ignore]
+    fn compile_check_{}() {{
+        use super::*;
+"####,
+            per_name
+        )?;
+
         writeln!(
             out,
             "        let mut {} = CSR::new(HW_{}_BASE as *mut u32);",
@@ -958,9 +1038,11 @@ mod tests {
                 )?;
             }
         }
+
+        writeln!(out, "  }}")?;
     }
-    writeln!(out, "    }}")?;
     writeln!(out, "}}")?;
+
     Ok(())
 }
 

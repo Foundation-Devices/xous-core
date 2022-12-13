@@ -1,71 +1,72 @@
-# MTXCLI
+# mtxcli
 
-This is a new Matrix chat application which will be derived from REPL.
+This is a simple Matrix chat application.
 
-_NOTE_: constant is in gam/src/lib.rs (APP_NAME_MTXCLI) is generated automatically
-with `cargo xtask app-image mtxcli` or `cargo xtask run mtxcli`.
+Here you see **mtxcli** running in hosted mode:
 
-# Inherited from REPL
-
-A simple demo application that provides a bare-bones REPL framework.
-## Copying This Demo to a New App
-
-1. Copy this demo application, and rename the relevant structures in its `Cargo.toml` and `main.rs`.
-2. Add it to the Workspace `default-members` and `members` arrays by editing `./Cargo.toml`
-3. Edit the `manifest.json` file as documented in its [README](../README.md)
-4. Build using `cargo xtask app-image you_new_app` to create a flashable Xous image with your app in it.
-## Details
-
-![screenshot](repl_screenshot.png)
-
-`repl` is a baseline demo application for Xous. It uses a chat-client
-style interface (stacking bubbles of text, with user input right-aligned
-and shell feedback left-aligned) to facilitate interactions.
-
-It implements the basic envisioned structure of a Xous application, namely:
-
- - Text input comes via the `ime-frontend`
- - Graphical output is rendered via the `gam`
-
-[Push Events and Listeners](https://github.com/betrusted-io/xous-core/wiki/Push-Events-and-Listeners) provides an overview of the flow of
-messages between an Xous application and the Xous Services.
-
-The one demo command provisioned in the `repl` app plays a tone via
-the `codec` service. This was chosen because it is about one of the most complicated
-and comprehensive things you can do in the `repl` environment, as it requires
-real-time callbacks to fill the audio buffer with new samples. If you have
-specific questions about how the callbacks work, we encourage you to open
-an issue in this repo and ask your question. Your questions will help us
-direct effort toward building the documentation base.
-
-To make your own command, copy the `audio.rs` template
-in the `apps/repl/src/cmds/` directory, or use this very basic `echo`
-template:
-
-```Rust
-use crate::{ShellCmdApi, CommonEnv};
-use xous_ipc::String;
-
-#[derive(Debug)]
-pub struct Echo {
-}
-
-impl<'a> ShellCmdApi<'a> for Echo {
-    cmd_api!(echo); // inserts boilerplate for command API
-
-    fn process(&mut self, args: String::<1024>, _env: &mut CommonEnv) -> Result<Option<String::<1024>>, xous::Error> {
-        Ok(Some(rest))
-    }
-}
+```
+cargo xtask run mtxcli
 ```
 
-The "verb" is the name of your command, and it is the argument to the `cmd_api!()` macro.
+![screenshot](mtxcli-emulator.gif)
 
-`process()` is your "main" function, and `args` is a string which contains the
-rest of the line that was typed into the chat, minus the verb used to identify
-your command (e.g. the arguments, but not tokenized or parsed in
-any way). `env` contains some items in a common environment, for example, connections
-to the GAM, LLIO server or other resources required by your implementation.
+## Background
 
-Once you've added your command to the directory, go to the `cmds.rs` file, and follow
-the four-step instructions embedded within the file, starting around line 40.
+This is a simple [Matrix chat](https://matrix.org/) application based on the REPL framework and adapted from the Desktop project [mtxcli](https://github.com/betrusted-io/mtxcli)
+
+## Setup
+
+In order to simplify the **mtxcli** application as much as possible the following
+must be setup on a conventional device before using Betrusted (laptop, mobile phone).
+
+* Create a new Matrix user (if needed):
+  * https://matrix.org/faq/#how-do-i-get-an-account-and-get-started%3F
+  * https://matrix.org/docs/projects/try-matrix-now/
+* Find (or create) a new room to join for chatting:
+  * https://doc.matrix.tu-dresden.de/en/rooms/create/
+  * https://spec.matrix.org/latest/#room-structure
+* Join the room
+* Save the configuration in the pddb
+  * `/set user @myname:matrix.org`
+  * `/set password MySecret`
+  * `/set room #my-chat-room`
+
+## Commands
+
+The following commands are available in **mtxcli**:
+* `/help [cmd]` -- shows help message for all commands (or one cmd if given)
+* `/login` -- logs in to the server (assumes user and password are set)
+* `/logout` -- logs out of the server
+* `/get key` -- shows value of key (from the PDDB)
+* `/set key value` -- sets value of key (in the PDDB)
+* `/unset key` -- removes key (from the PDDB)
+* `/status` -- shows status of the connection
+
+## Chatting
+
+Any line not starting with a slash ('/') will be sent to the current room.
+New messages from the current room will be displayed.
+
+## mtxcli on the Precursor device
+
+Here are some images of runing **mtxcli** on the Precursor.
+_NOTE_: this Precusor has the [Pi HAT](https://github.com/betrusted-io/betrusted-wiki/wiki/Updates-for-Advanced-Users#failsafe-method) installed.
+
+![screenshot](mtxcli-precursor.gif)
+
+## mtxcli in French
+
+I recently added the French localization to Xous -- including
+translating all of **mtxcli**. For more about locales and
+Xous please see the [locales README](https://github.com/betrusted-io/xous-core/blob/main/locales/README.md)
+
+![screenshot](xous-french.png)
+
+## Acknowledgements
+
+This app is supported in part by a grant from the
+[NGI0 PET Fund](https://nlnet.nl/PET/),
+a fund established by NLnet with financial support from the
+European Commission's [Next Generation Internet](https://www.ngi.eu/) program.
+
+![nl.net+NGI0](https://www.crowdsupply.com/img/001b/precursor-grant-logos_png_md-xl.jpg)

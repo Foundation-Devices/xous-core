@@ -12,7 +12,7 @@ use std::env;
 
 /// gitrev of the current precursor SoC version targeted by this build. This must
 /// be manually updated every time the SoC version is bumped.
-const PRECURSOR_SOC_VERSION: &str = "c809403";
+const PRECURSOR_SOC_VERSION: &str = "70190e2";
 
 /*
   Some notes on kernel versions versus backups.
@@ -117,12 +117,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // packages located on crates.io. For testing non-local build configs that are less
     // concerned about software supply chain and more focused on developer convenience.
     let base_pkgs_remote = [
-        "xous-log@0.1.7",         // "well known" service: debug logging
-        "xous-names@0.9.15",      // "well known" service: manage inter-server connection lookup
-        "xous-susres@0.1.10",     // ticktimer registers with susres to coordinate time continuity across sleeps
-        "xous-ticktimer@0.1.9",   // "well known" service: thread scheduling
+        "xous-log@0.1.19",         // "well known" service: debug logging
+        "xous-names@0.9.28",      // "well known" service: manage inter-server connection lookup
+        "xous-susres@0.1.24",     // ticktimer registers with susres to coordinate time continuity across sleeps
+        "xous-ticktimer@0.1.23",   // "well known" service: thread scheduling
     ].to_vec();
-    let xous_kernel_remote = "xous-kernel@0.9.9";
+    let xous_kernel_remote = "xous-kernel@0.9.24";
 
     // ---- extract position independent args ----
     let lkey = get_flag("--lkey")?;
@@ -272,6 +272,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                    .add_apps(&get_cratespecs());
         }
         Some("perf-image") => {
+            // `--feature vaultperf` will make `vault` the performance manager, in exclusion of shellchat
+            if !builder.has_feature("shellperf") && !builder.has_feature("vaultperf") {
+                // select `shellchat` as the performance manager by default.
+                builder.add_feature("shellperf");
+            }
             // note: to use this image, you need to load a version of the SOC that has the performance counters built in.
             // this can be generated using the command `python3 .\betrusted_soc.py -e .\dummy.nky --perfcounter` in the betrusted-soc repo.
             //
@@ -284,6 +289,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                    .add_apps(&get_cratespecs())
                    .add_feature("perfcounter")
                    .add_kernel_feature("v2p");
+        }
+        Some("dvt-image") => {
+            // this image targets a mostly deprecated DVT hardware generation. The purpose of it is to re-use some
+            // of the now-defunct hardware for eFuse code testing, especially since FPGAs have gotten very scarce.
+            // Once the eFuse path is validated, we could remove this target.
+            let mut services: Vec<String> = user_pkgs
+                .into_iter()
+                .map(String::from).collect();
+            services.retain(|x| x != "codec"); // codec is not compatible with DVT boards
+
+            builder.target_precursor("2753c12-dvt")
+                   .add_services(&services)
+                   .add_feature("no-codec")
+                   .add_feature("dvt")
+                   .add_apps(&get_cratespecs());
         }
         Some("tts") => {
             builder.target_precursor(PRECURSOR_SOC_VERSION);
@@ -353,7 +373,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // checking before you can check them!
     let do_verify = env::args().filter(|x| x == "--no-verify").count() == 0;
     if do_verify {
-        check_project_consistency()
+        match check_project_consistency() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Explain to developers why this step is important.
+                println!("Local source changes have not been published. If you meant to modify core components,");
+                println!("activate patches in top-level Cargo.toml to redirect crates.io to the local source tree.");
+                println!("Otherwise, your local changes are IGNORED.");
+                println!("Use the `--no-verify` argument to suppress this warning.");
+                Err(e)
+            }
+        }
     } else {
         Ok(())
     }

@@ -248,7 +248,7 @@ mod implementation {
 }
 
 // a stub to try to avoid breaking hosted mode for as long as possible.
-#[cfg(any(feature="hosted"))]
+#[cfg(not(target_os = "xous"))]
 mod implementation {
     use crate::api::BattStats;
     use crate::return_battstats;
@@ -654,7 +654,14 @@ fn main() -> ! {
                     //info!("0x{:04x}", word);
                 }
             }
-            Some(Opcode::PowerOffSoc) => {
+            Some(Opcode::PowerOffSoc) => { // NOTE: this is deprecated, use susres.immediate_poweroff() instead. Power sequencing requirements have changed since this was created, this routine does not actually cut power anymore.
+                com.txrx(ComState::CHG_BOOST_OFF.verb);
+                com.txrx(ComState::LINK_SET_INTMASK.verb);
+                com.txrx(0); // suppress interrupts on suspend
+
+                if bl_main != 0 || bl_sec != 0 {
+                    com.txrx(ComState::BL_START.verb); // this will turn off the backlights
+                }
                 info!("power off called");
                 com.txrx(ComState::POWER_OFF.verb);
                 com.wait_txrx(ComState::LINK_READ.verb, Some(STD_TIMEOUT)); // consume the obligatory return value, even if not used
@@ -666,6 +673,8 @@ fn main() -> ! {
                 com.txrx(ComState::CHG_BOOST_ON.verb);
             }
             Some(Opcode::SetBackLight) => msg_scalar_unpack!(msg, main, secondary, _, _, {
+                #[cfg(not(target_os = "xous"))]
+                log::info!("HOSTED: set backlight to {},{}", main, secondary);
                 bl_main = main;
                 bl_sec = secondary;
                 com.txrx(ComState::BL_START.verb | (main as u16) & 0x1f | (((secondary as u16) & 0x1f) << 5));
@@ -988,7 +997,13 @@ fn main() -> ! {
                     let rssi = if (maybe_rssi >> 8) & 0xff != 0 {
                         None
                     } else {
-                        Some(maybe_rssi & 0xff)
+                        // rssi as reported is a number from 0-110, where 110 is 0 dbm.
+                        // a perhaps dubious decision was made to shift the reported value over by one before
+                        // returning to the host, so we lost a 0.5dBm step. But...not a big deal, and not worth
+                        // putting every user through an EC update to gain some resolution they never see.
+                        // note there is also a function in lib.rs/wlan_get_rssi() that has to be patched if
+                        // this is fixed.
+                        Some((110 - maybe_rssi) & 0xff)
                     };
                     let link_state = com.wait_txrx(ComState::LINK_READ.verb, Some(STD_TIMEOUT));
                     let mut ipv4_raw = Ipv4Conf::default().encode_u16();
@@ -1006,6 +1021,7 @@ fn main() -> ! {
                     let ssid_str = core::str::from_utf8(&ssid_buf[2..2+ssid_checked_len]).unwrap_or("Disconnected");
                     let status = WlanStatusIpc {
                         ssid: if let Some(rssi) = rssi {
+                            log::debug!("RSSI: -{}dBm", rssi);
                             Some(SsidRecord {
                                 rssi: rssi as u8,
                                 name: xous_ipc::String::<32>::from_str(ssid_str)
@@ -1027,7 +1043,7 @@ fn main() -> ! {
                 for dest in prealloc.iter_mut() {
                     *dest = com.wait_txrx(ComState::LINK_READ.verb, Some(STD_TIMEOUT));
                 }
-                #[cfg(any(feature="hosted"))]
+                #[cfg(not(target_os = "xous"))]
                 { // assign a fake MAC address in hosted mode so we don't crash smoltcp
                     for i in 1..4 {
                         prealloc[i] = i as u16 - 1;

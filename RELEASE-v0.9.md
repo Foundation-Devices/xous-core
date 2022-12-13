@@ -278,10 +278,32 @@ perform the Xous firmware upgrade. This requires running manual update commands,
   - backups now take about an extra minute to run, due to the inclusion of the extra checksums
   - backups are no longer abortable, because in order to do the checksums, we have to unmount the PDDB and put the system into a semi-shutdown state. A confirmation screen now gates backups to avoid users accidentally triggering backups with a fat-fingered menu selection.
 
+## New in 0.9.11
+- Various infrastructure fixes contributed by @eupn and @jeandudey
+- "Lock device" feature added; PDDB unmount before reboots
+- Successive failed PIN attempts will re-suspend the device if it is suspendable, or reboot if not
+- Fix bug in device auto-shutdown; COM/LLIO method deprecated as susres method does the correct sequencing. This should help with some of the "insert paperclip" scenarios after updating SoC, hopefully.
+- Updated VexRiscv core to the latest version. STATIC branch prediction enabled and slightly faster I$ gives a small performance bump. Also fixes a bug with cache flushing that was causing coherence problems with the PDDB.
+- Fix tricky loader bug that was causing subtle issues with various build configurations
+- Suppress main menu from popping up before the PDDB is mounted (resolves race conditions based on PDDB-stored keys)
+- Optimize PDDB bulk key listing performance
+- Add French language locale (thanks @tmarble!)
+- Add `mtxcli` application, a basic Matrix chat interface (currently just https-secured, not E2EE). Thanks again @tmarble for the contribution!
+- Several infrastructure changes/improvements to how utralib and crating works
+- Add some UX cues on boot asking the user to wait for various operations.
+- Fix context switching in GAM. Now, when relinquishing a context, the context is switched before the response is fired back to the caller. This means that it is much less likely that the caller will start drawing prematurely and have the draw ops missed.
+- Rework main menu & preferences to use a dedicated "preferences" submenu (thanks @gsora!). This change will cause your system to prompt you to set the time again, because the location of the time zone record changes.
+- Notes in `vault` are now editable without deleting the existing text
+- `vault` password import from CSV using `vaultbackup-rs` (a host-based Rust program found in `apps/vault/tools`)
+- eFuse burning now in Beta.
+  - Burn an indelible backup key into your device without any third-party hardware
+  - Loss of the backup key will brick your device permanently. Bugs in the burning process could also brick your device.
+  - Testers need to build with `--feature efuse` in the command line. The process is not yet high confidence, so, proceed at your own risk!
+  - Please contact bunnie if you plan to try this feature. Because it is permanent, and there is limited production due to supply chain issues, only minimal testing could be performed.
+- Fixed GAM issue where canvases previously defaced would be re-defaced every time the canvas order is computed.
+- Wifi signal is now rendered as bars, instead of as a number (thanks @gsora for PR#283!).
 
-## Roadmap to 1.0
-
+## Roadmap
 - Lots of testing and bug fixes
-- Understanding what the gap is to get TLS working
 - Fixing performance issues in `pddb`
 - Refactoring `modals` to not have N^2 space growth with feature set

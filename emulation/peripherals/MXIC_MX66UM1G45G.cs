@@ -13,7 +13,7 @@ using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.SPI.NORFlash;
 using Antmicro.Renode.Utilities;
 
-namespace Antmicro.Renode.Peripherals.SPI
+namespace Antmicro.Renode.Peripherals.SPI.Betrusted
 {
     public class MXIC_MX66UM1G45G : ISPIPeripheral
     {
@@ -275,6 +275,13 @@ namespace Antmicro.Renode.Peripherals.SPI
                     currentOperation.Operation = DecodedOperation.OperationType.None;
                     enable.Value = false;
                     return; //return to prevent further logging
+
+                case (byte)Commands.SectorErase4byte:
+                    currentOperation.Operation = DecodedOperation.OperationType.Erase;
+                    currentOperation.EraseSize = DecodedOperation.OperationEraseSize.Sector;
+                    currentOperation.AddressLength = 4;
+                    currentOperation.State = DecodedOperation.OperationState.AccumulateNoDataCommandAddressBytes;
+                    break;
 
                 case (byte)Commands.SubsectorErase4byte4kb:
                     currentOperation.Operation = DecodedOperation.OperationType.Erase;
@@ -685,6 +692,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 tmp_byte[0] = val;
                 InternalBackingFile.Seek(position, SeekOrigin.Begin);
                 InternalBackingFile.Write(tmp_byte, 0, 1);
+                InternalBackingFile.Flush();
             }
         }
 

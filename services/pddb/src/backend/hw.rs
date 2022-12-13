@@ -36,6 +36,11 @@ use digest::Digest;
 #[cfg(feature="migration1")]
 use crate::backend::migration1to2::*;
 
+#[cfg(feature="perfcounter")]
+use perflib::*;
+#[cfg(feature="perfcounter")]
+use utralib::AtomicCsr;
+
 /// Implementation-specific PDDB structures: for Precursor/Xous OS pair
 pub(crate) const MBBB_PAGES: usize = 10;
 pub(crate) const FSCB_PAGES: usize = 16;
@@ -118,9 +123,9 @@ struct MigrationCiphers {
 }
 
 // emulated
-#[cfg(any(feature="hosted"))]
+#[cfg(not(target_os = "xous"))]
 type EmuMemoryRange = EmuStorage;
-#[cfg(any(feature="hosted"))]
+#[cfg(not(target_os = "xous"))]
 type EmuSpinor = HostedSpinor;
 
 // native hardware
@@ -166,8 +171,18 @@ pub(crate) struct PddbOs {
     entropy: Rc<RefCell<TrngPool>>,
     /// connection to the password request manager
     pw_cid: xous::CID,
+    /// Number of consecutive failed login attempts
+    failed_logins: u64,
     #[cfg(all(feature="pddbtest", feature="autobasis"))]
     testnames: HashSet::<String>,
+    /// Performance counter elements
+    #[cfg(feature="perfcounter")]
+    perfclient: PerfClient,
+    #[cfg(feature="perfcounter")]
+    pc_id: u32,
+    #[cfg(feature="perfcounter")]
+    /// used to toggle performance profiling on or off
+    use_perf: bool,
 }
 
 impl PddbOs {
@@ -194,6 +209,21 @@ impl PddbOs {
 
         let llio = llio::Llio::new(&xns);
         let dna = llio.soc_dna().unwrap();
+
+        // performance counter infrastructure, if selected
+        #[cfg(feature="perfcounter")]
+        let event2_csr = xous::syscall::map_memory(
+            xous::MemoryAddress::new(utralib::generated::utra::event_source2::HW_EVENT_SOURCE2_BASE),
+            None,
+            4096,
+            xous::MemoryFlags::R | xous::MemoryFlags::W,
+        )
+        .expect("couldn't map event2 CSR range");
+        #[cfg(feature="perfcounter")]
+        let perfclient = PerfClient::new(AtomicCsr::new(event2_csr.as_mut_ptr() as *mut u32));
+        #[cfg(feature="perfcounter")]
+        let pc_id = xous::process::id() as u32;
+
         // native hardware
         #[cfg(any(feature="precursor", feature="renode"))]
         let ret = PddbOs {
@@ -218,11 +248,18 @@ impl PddbOs {
             dna_mode: DnaMode::Normal,
             entropy: trngpool,
             pw_cid,
+            failed_logins: 0,
             #[cfg(all(feature="pddbtest", feature="autobasis"))]
             testnames: HashSet::new(),
+            #[cfg(feature="perfcounter")]
+            perfclient,
+            #[cfg(feature="perfcounter")]
+            pc_id,
+            #[cfg(feature="perfcounter")]
+            use_perf: true,
         };
         // emulated
-        #[cfg(any(feature="hosted"))]
+        #[cfg(not(target_os = "xous"))]
         let ret = {
             PddbOs {
                 spinor: HostedSpinor::new(),
@@ -246,6 +283,7 @@ impl PddbOs {
                 dna_mode: DnaMode::Normal,
                 entropy: trngpool,
                 pw_cid,
+                failed_logins: 0,
                 #[cfg(all(feature="pddbtest", feature="autobasis"))]
                 testnames: HashSet::new(),
             }
@@ -253,7 +291,7 @@ impl PddbOs {
         ret
     }
 
-    #[cfg(any(feature="hosted"))]
+    #[cfg(not(target_os = "xous"))]
     pub fn dbg_dump(&self, name: Option<String>, extra_keys: Option<&Vec::<KeyExport>>) {
         self.pddb_mr.dump_fs(&name);
         let mut export = Vec::<KeyExport>::new();
@@ -284,7 +322,20 @@ impl PddbOs {
         // placeholder
     }
     #[allow(dead_code)]
-    #[cfg(any(feature="hosted"))]
+    #[cfg(feature="perfcounter")]
+    pub fn set_use_perf(&mut self, use_perf: bool) {
+        self.use_perf = use_perf;
+    }
+    #[allow(dead_code)]
+    #[cfg(feature="perfcounter")]
+    pub fn perf_entry(&mut self, file_id: u32, meta: u32, index: u32, line: u32) {
+        if self.use_perf {
+            let entry = perf_entry!(self.pc_id, file_id, meta, index, line);
+            self.perfclient.log_event_unchecked(entry);
+        }
+    }
+    #[allow(dead_code)]
+    #[cfg(not(target_os = "xous"))]
     /// used to reset the hardware structure for repeated runs of testing within a single invocation
     pub fn test_reset(&mut self) {
         self.fspace_cache = FspaceSet::new();
@@ -322,6 +373,7 @@ impl PddbOs {
     /// exactly to the first entry in the page table
     pub(crate) fn patch_data(&self, data: &[u8], offset: u32) {
         log::trace!("patch offset: {:x} len: {:x}", offset, data.len());
+        // log::trace!("patch bef: {:x?}", &self.pddb_mr.as_slice::<u8>()[offset as usize + self.data_phys_base.as_usize()..offset as usize + self.data_phys_base.as_usize() + 48]);
         assert!(data.len() + offset as usize <= PDDB_A_LEN - self.data_phys_base.as_usize(), "attempt to store past disk boundary");
         self.spinor.patch(
             self.pddb_mr.as_slice(),
@@ -329,6 +381,8 @@ impl PddbOs {
             &data,
             offset + self.data_phys_base.as_u32(),
         ).expect("couldn't write to data region in the PDDB");
+        //log::trace!("patch aft: {:x?}", &self.pddb_mr.as_slice::<u8>()[offset as usize + self.data_phys_base.as_usize()..offset as usize + self.data_phys_base.as_usize() + 48]);
+        //log::trace!("patch end: {:x?}", &self.pddb_mr.as_slice::<u8>()[offset as usize + self.data_phys_base.as_usize() + 4048..offset as usize + self.data_phys_base.as_usize() + 4096])
     }
     fn patch_pagetable(&self, data: &[u8], offset: u32) {
         if cfg!(feature = "mbbb") {
@@ -660,7 +714,8 @@ impl PddbOs {
                     }
                     _ => {
                         log::error!("Couldn't unwrap our system key: {:?}", e);
-                        return PasswordState::Incorrect;
+                        self.failed_logins = self.failed_logins.saturating_add(1);
+                        return PasswordState::Incorrect(self.failed_logins);
                     }
                 }
             }
@@ -675,7 +730,8 @@ impl PddbOs {
                     }
                     _ => {
                         log::error!("Couldn't unwrap our system key: {:?}", e);
-                        return PasswordState::Incorrect;
+                        self.failed_logins = self.failed_logins.saturating_add(1);
+                        return PasswordState::Incorrect(self.failed_logins);
                     }
                 }
             }
@@ -708,8 +764,10 @@ impl PddbOs {
             for i in 0..syskey_pt.len() {
                 unsafe{nuke.add(i).write_volatile(0)};
             }
+            self.failed_logins = 0;
             PasswordState::Correct
         } else {
+            self.failed_logins = 0;
             PasswordState::Correct
         }
     }
@@ -1565,6 +1623,7 @@ impl PddbOs {
                 msg: &data,
             }
         ).expect("couldn't encrypt data");
+        // log::trace!("calling patch. nonce {:x?}, ct {:x?}, data {:x?}", nonce.as_slice(), &ciphertext[..32], &data[..32]);
         self.patch_data(&[nonce.as_slice(), &ciphertext].concat(), pp.page_number() * PAGE_SIZE as u32);
     }
 
@@ -1765,6 +1824,8 @@ impl PddbOs {
                     t!("pddb.erase", xous::LANG),
                     xous::PDDB_LOC, xous::PDDB_LOC + PDDB_A_LEN as u32, xous::PDDB_LOC)
                     .expect("couldn't raise progress bar");
+                // retain this delay, because the next section is so compute-intensive, it may take a
+                // while for the GAM to catch up.
                 self.tt.sleep_ms(100).unwrap();
             }
             for offset in (xous::PDDB_LOC..(xous::PDDB_LOC + PDDB_A_LEN as u32)).step_by(SPINOR_BULK_ERASE_SIZE as usize) {
@@ -1790,6 +1851,7 @@ impl PddbOs {
             if let Some(modals) = progress {
                 modals.update_progress(xous::PDDB_LOC + PDDB_A_LEN as u32).expect("couldn't update progress bar");
                 modals.finish_progress().expect("couldn't dismiss progress bar");
+                #[cfg(feature="ux-swap-delay")]
                 self.tt.sleep_ms(100).unwrap();
             }
         }
@@ -1822,6 +1884,7 @@ impl PddbOs {
         }
         if let Some(modals) = progress {
             modals.finish_progress().expect("couldn't dismiss progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
 
@@ -1832,6 +1895,7 @@ impl PddbOs {
         //}
         if let Some(modals) = progress {
             modals.start_progress(t!("pddb.key", xous::LANG), 0, 100, 0).expect("couldn't raise progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
         assert!(size_of::<StaticCryptoData>() == PAGE_SIZE, "StaticCryptoData structure is not correctly sized");
@@ -1855,6 +1919,7 @@ impl PddbOs {
         crypto_keys.version = SCD_VERSION; // should already be set by `default()` but let's be sure.
         if let Some(modals) = progress {
             modals.update_progress(50).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
         // copy the encrypted key into the data structure for commit to Flash
@@ -1873,13 +1938,15 @@ impl PddbOs {
         self.patch_keys(crypto_keys.deref(), 0);
         if let Some(modals) = progress {
             modals.update_progress(100).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
             modals.finish_progress().expect("couldn't dismiss progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
         // now we have a copy of the AES key necessary to encrypt the default System basis that we created in step 2.
 
-        #[cfg(any(feature="hosted"))]
+        #[cfg(not(target_os = "xous"))]
         self.tt.sleep_ms(500).unwrap(); // delay for UX to catch up in emulation
 
         // step 4. mbbb handling
@@ -1901,17 +1968,20 @@ impl PddbOs {
         }
         if let Some(modals) = progress {
             modals.update_progress(50).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
         self.fast_space_write(&fast_space);
         if let Some(modals) = progress {
             modals.update_progress(100).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
             modals.finish_progress().expect("couldn't dismiss progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
 
-        #[cfg(any(feature="hosted"))]
+        #[cfg(not(target_os = "xous"))]
         self.tt.sleep_ms(500).unwrap();
 
         // step 5. salt the free space with random numbers. this can take a while, we might need a "progress report" of some kind...
@@ -1920,6 +1990,7 @@ impl PddbOs {
         if let Some(modals) = progress {
             modals.start_progress(t!("pddb.randomize", xous::LANG),
             self.data_phys_base.as_u32(), PDDB_A_LEN as u32, self.data_phys_base.as_u32()).expect("couldn't raise progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
         let blank = [0xffu8; aes::BLOCK_SIZE];
@@ -1959,14 +2030,17 @@ impl PddbOs {
         }
         if let Some(modals) = progress {
             modals.update_progress(PDDB_A_LEN as u32).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
             modals.finish_progress().expect("couldn't dismiss progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
 
         // step 6. create the system basis root structure
         if let Some(modals) = progress {
             modals.start_progress(t!("pddb.structure", xous::LANG), 0, 100, 0).expect("couldn't raise progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
         let basis_root = BasisRoot {
@@ -1981,6 +2055,7 @@ impl PddbOs {
         self.fast_space_read(); // we reconstitute our fspace map even though it was just generated, partially as a sanity check that everything is ok
         if let Some(modals) = progress {
             modals.update_progress(33).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
 
@@ -2016,6 +2091,7 @@ impl PddbOs {
         self.system_basis_key = Some(syskey); // put the key back
         if let Some(modals) = progress {
             modals.update_progress(66).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
 
@@ -2027,8 +2103,10 @@ impl PddbOs {
         }
         if let Some(modals) = progress {
             modals.update_progress(100).expect("couldn't update progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
             modals.finish_progress().expect("couldn't dismiss progress bar");
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(100).unwrap();
         }
         Ok(())
@@ -2325,6 +2403,7 @@ impl PddbOs {
     /// at the conclusion of the sweep, but their page use can be accounted for.
     #[cfg(not(all(feature="pddbtest", feature="autobasis")))]
     pub(crate) fn pddb_get_all_keys(&self, cache: &Vec::<BasisCacheEntry>) -> Option<Vec<(BasisKeys, String)>> {
+        #[cfg(feature="ux-swap-delay")]
         const SWAP_DELAY_MS: usize = 300;
         // populate the "known" entries
         let mut ret = Vec::<(BasisKeys, String)>::new();
@@ -2361,6 +2440,7 @@ impl PddbOs {
                 DnaMode::Churn => t!("pddb.churn.request", xous::LANG),
             },
             None).ok();
+        #[cfg(feature="ux-swap-delay")]
         self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
 
         // 0.5 display the Bases that we know
@@ -2370,10 +2450,12 @@ impl PddbOs {
             blist.push_str(name);
         }
         modals.show_notification(&blist, None).ok();
+        #[cfg(feature="ux-swap-delay")]
         self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
 
         // 1. prompt user to enter any name/password combos for other basis we want to keep
         while self.yes_no_approval(&modals, t!("pddb.freespace.enumerate_another", xous::LANG)) {
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
 
             match modals
@@ -2419,11 +2501,13 @@ impl PddbOs {
                         ret.push((basis_key, name));
                     } else {
                         modals.show_notification(t!("pddb.freespace.badpass", xous::LANG), None).ok();
+                        #[cfg(feature="ux-swap-delay")]
                         self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
                     }
                 },
                 _ => return None,
             };
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
             // 4. repeat summary print-out
             let mut blist = String::from(t!("pddb.freespace.currentlist", xous::LANG));
@@ -2432,6 +2516,7 @@ impl PddbOs {
                 blist.push_str(name);
             }
             modals.show_notification(&blist, None).ok();
+            #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
         }
         // done!
@@ -2879,7 +2964,7 @@ impl PddbOs {
         log::info!("v1 PDDB detected. Attempting to migrate from v1->v2.");
         log::info!("old SCD block: {:x?}", &scd.deref()[..128]); // this is not hazardous because the keys were wrapped
 
-        #[cfg(any(feature="hosted"))]
+        #[cfg(not(target_os = "xous"))]
         let mut export = Vec::<KeyExport>::new(); // export any basis keys for verification in hosted mode
 
         // derive a v1 key
@@ -3020,7 +3105,7 @@ impl PddbOs {
                                                 &basis_data_cipher_2,
                                                 &mut used_pages,
                                             ) {
-                                                #[cfg(any(feature="hosted"))]
+                                                #[cfg(not(target_os = "xous"))]
                                                 {
                                                     let mut name = [0 as u8; 64];
                                                     for (&src, dst) in bname.first().as_str().as_bytes().iter().zip(name.iter_mut()) {
@@ -3094,15 +3179,16 @@ impl PddbOs {
                 }
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-                #[cfg(any(feature="hosted"))]
+                #[cfg(not(target_os = "xous"))]
                 self.dbg_dump(Some("migration".to_string()), Some(&export));
 
                 // indicate the migration worked
+                self.failed_logins = 0;
                 PasswordState::Correct
             }
             Err(e) => {
                 log::error!("Couldn't unwrap our system key: {:?}", e);
-                PasswordState::Incorrect
+                PasswordState::Incorrect(self.failed_logins)
             }
         }
     }

@@ -5,24 +5,26 @@ import re
 import subprocess
 import time
 
-# format is {crate : path}
-CRATES = {
-    "xous" : "xous-rs",
-    "xous-kernel" : "kernel",
-    "xous-ipc" : "xous-ipc",
-    "xous-api-log" : "api/xous-api-log",
-    "xous-api-names" : "api/xous-api-names",
-    "xous-api-susres" : "api/xous-api-susres",
-    "xous-api-ticktimer" : "api/xous-api-ticktimer",
-    "xous-log" : "services/xous-log",
-    "xous-names" : "services/xous-names",
-    "xous-susres" : "services/xous-susres",
-    "xous-ticktimer" : "services/xous-ticktimer",
-}
-UTRA_CRATES = {
-    "svd2utra" : "svd2utra",
-    "utralib" : "utralib",
-}
+# format is [crate : path]
+# this is an ordered list that also prescribes the publication order to crates.io
+UTRA_CRATES = [
+    ["svd2utra", "svd2utra"],
+    ["utralib", "utralib"],
+]
+CRATES = [
+    ["xous", "xous-rs"],
+    ["xous-kernel", "kernel"],
+    ["xous-ipc", "xous-ipc"],
+    ["xous-api-log", "api/xous-api-log"],
+    ["xous-api-names", "api/xous-api-names"],
+    ["xous-api-susres", "api/xous-api-susres"],
+    ["xous-api-ticktimer", "api/xous-api-ticktimer"],
+    ["xous-log", "services/xous-log"],
+    ["xous-names", "services/xous-names"],
+    ["xous-susres", "services/xous-susres"],
+    ["xous-ticktimer", "services/xous-ticktimer"],
+]
+# dictionary of crate names -> version strings
 VERSIONS = {}
 
 class PatchInfo:
@@ -32,6 +34,7 @@ class PatchInfo:
             print("Bad crate path: {}".format(filename))
         self.cratename = cratename
         self.cratelist = cratelist
+        self.debug = False
 
     def get_version(self):
         with open(self.filepath, 'r') as file:
@@ -50,21 +53,33 @@ class PatchInfo:
                         version = line.split('=')[1].replace('"', '').strip()
                     if line.strip().startswith('name'):
                         name = line.split('=')[1].replace('"', '').strip()
-                        if name in self.cratelist:
-                            name_check = True
+                        for [item_name, path] in self.cratelist:
+                            if name == item_name:
+                                name_check = True
             if name_check:
                 assert version is not None # "Target name found but no version was extracted!"
                 VERSIONS[name] = version
 
             return name_check
 
+    def debug_mode(self, arg):
+        self.debug = arg
+
+    def output(self, line):
+        if self.debug:
+            print("Dry run: {}".format(line.rstrip()))
+            # pass
+        else:
+            self.file.write(line)
+
     # assumes that VERSIONS has been initialized.
-    def increment_versions(self):
+    def increment_versions(self, mode='bump'):
         # check that global variables are in sane states
         assert len(VERSIONS) > 0 # "No VERSIONS found, something is weird."
         with open(self.filepath, 'r') as file:
             lines = file.readlines()
-        with open(self.filepath, 'w') as file:
+        with open(self.filepath, 'w', newline='\n') as file:
+            self.file = file
             in_package = False
             in_dependencies = False
             for line in lines:
@@ -77,18 +92,18 @@ class PatchInfo:
                         in_dependencies = True
                     else:
                         in_dependencies = False
-                    file.write(line)
+                    self.output(line)
                 elif line.strip().startswith('#'): # skip comments
-                    file.write(line)
+                    self.output(line)
                 elif in_package:
-                    # increment my own version, if I'm in the listed crates
-                    if self.cratename is not None:
+                    # increment my own version, if I'm in the listed crates and we're in 'bump' mode
+                    if (self.cratename is not None) and (mode == 'bump'):
                         if line.strip().startswith('version'):
-                            file.write('version = "{}"\n'.format(bump_version(VERSIONS[self.cratename])))
+                            self.output('version = "{}"\n'.format(bump_version(VERSIONS[self.cratename])))
                         else:
-                            file.write(line)
+                            self.output(line)
                     else:
-                        file.write(line)
+                        self.output(line)
 
                     if line.strip().startswith('name'):
                         this_crate = line.split('=')[1].replace('"', '').strip()
@@ -116,17 +131,69 @@ class PatchInfo:
 
                     # print("{}:{}".format(this_crate, depcrate))
                     if depcrate in VERSIONS:
-                        oldver = VERSIONS[depcrate]
-                        (newline, numsubs) = re.subn(oldver, bump_version(oldver), line)
-                        if numsubs != 1 and not "\"*\"" in newline:
-                            print("Warning! Version substitution failed for {}:{} in crate {} ({})".format(depcrate, oldver, this_crate, numsubs))
+                        if mode == 'bump':
+                            oldver = VERSIONS[depcrate]
+                            (newline, numsubs) = re.subn(oldver, bump_version(oldver), line)
+                            if numsubs != 1 and not "\"*\"" in newline:
+                                print("Warning! Version substitution failed for {}:{} in crate {} ({})".format(depcrate, oldver, this_crate, numsubs))
 
-                        # print("orig: {}\nnew: {}".format(line, newline))
-                        file.write(newline)
+                            # print("orig: {}\nnew: {}".format(line, newline))
+                            self.output(newline)
+                        elif mode == 'to_local':
+                            if 'path' in line:
+                                self.output(line) # already local path, do nothing
+                            else:
+                                for [name, path] in self.cratelist:
+                                    if depcrate == name:
+                                        # print("self.file: {}".format(self.file.name))
+                                        depth = self.file.name.count('/')
+                                        base = '../' * (depth)
+                                        subpath = 'path = "{}{}"'.format(base, path)
+                                if subpath is None:
+                                    print("Error: couldn't find substitution path for dependency {}".format(depcrate))
+
+                                if 'version' in line:
+                                    oldver = 'version = "{}"'.format(VERSIONS[depcrate])
+                                    newpath = subpath
+                                else:
+                                    oldver = '"{}"'.format(VERSIONS[depcrate])
+                                    newpath = '{{ {} }}'.format(subpath)
+
+                                (newline, numsubs) = re.subn(oldver, newpath, line)
+                                if numsubs != 1 and not "\"*\"" in newline:
+                                    print("Warning! Path substitution failed for {}:{} in crate {} ({})".format(depcrate, oldver, this_crate, numsubs))
+
+                                self.output(newline)
+                        elif mode == 'to_remote':
+                            if 'path' not in line:
+                                self.output(line) # already remote, nothing to do
+                            else:
+                                if '{' in line and ',' in line:
+                                    specs = re.split(',|}|{', line) # line.split(',')
+                                    for spec in specs:
+                                        if 'path' in spec:
+                                            oldpath = spec.rstrip().lstrip()
+                                    if oldpath is None:
+                                        print("Error! couldn't parse out path to substitute for dependency {}".format(depcrate))
+                                    newver = 'version = "{}"'.format(VERSIONS[depcrate])
+                                    (newline, numsubs) = re.subn(oldpath, newver, line)
+                                    if numsubs != 1 and not "\"*\"" in newline:
+                                        print("Warning! Path substitution failed for {}:{} in crate {} ({})".format(depcrate, oldpath, this_crate, numsubs))
+                                    else:
+                                        # print("Substitute {}:{} in crate {} ({})".format(depcrate, oldpath, this_crate, newver))
+                                        # print("  " + oldpath)
+                                        # print("  " + newline)
+                                        pass
+                                    self.output(newline)
+                                else:
+                                    self.output('{} = "{}"\n'.format(depcrate, VERSIONS[depcrate]))
                     else:
-                        file.write(line)
+                        self.output(line)
                 else:
-                    file.write(line)
+                    self.output(line)
+                # if debug mode, just write the line unharmed
+                if self.debug:
+                    self.file.write(line)
 
 def bump_version(semver):
     components = semver.split('.')
@@ -137,11 +204,6 @@ def bump_version(semver):
         if index < len(components) - 1:
             retver += "."
     return retver
-
-def merge_two_dicts(x, y):
-    z = x.copy()
-    z.update(y)
-    return z
 
 def main():
     parser = argparse.ArgumentParser(description="Update and publish crates")
@@ -158,6 +220,12 @@ def main():
         "-p", "--publish", help="Publish crates", action="store_true",
     )
     parser.add_argument(
+        "-l", "--local-paths", help="Convert crate references to local paths", action="store_true"
+    )
+    parser.add_argument(
+        "-r", "--remote-paths", help="Convert crate references to remote paths", action="store_true"
+    )
+    parser.add_argument(
         "-w", "--wet-run", help="Used in conjunction with --publish to do a 'wet run'", action="store_true"
     )
     args = parser.parse_args()
@@ -166,21 +234,32 @@ def main():
         print("Warning: no dependencies selected, operation is a no-op. Use -x/-u/... to select dependency trees")
         exit(1)
 
-    cratelist = {}
-    if args.xous:
-        cratelist = merge_two_dicts(cratelist, CRATES)
-    if args.utralib:
-        cratelist = merge_two_dicts(cratelist, UTRA_CRATES)
+    cratelist = []
+    if args.utralib: # ordering is important, the UTRA crates need to publish before Xous crates
+        cratelist += UTRA_CRATES
         if not args.xous: # most Xous crates are also affected by this, so they need a bump as well
-            cratelist = merge_two_dicts(cratelist, CRATES)
+            cratelist += CRATES
+    if args.xous:
+        cratelist += CRATES
 
-    if args.bump:
+    if (args.bump or args.publish) and (args.local_paths or args.remote_paths):
+        print("Do not mix path changes with bump and publish operations. Do them serially.")
+        exit(1)
+    if args.local_paths and args.remote_paths:
+        print("Can't simultaneously change to local and remote paths. Pick only one operation.")
+        exit(1)
+
+    if args.bump or args.local_paths or args.remote_paths:
         cargo_toml_paths = []
         for path in Path('.').rglob('Cargo.toml'):
             if 'target' not in str(path):
                 not_core_path = True
-                for editpath in cratelist.values():
-                    if editpath in str(Path(path)).replace('\\', '/'): # fix windows paths
+                for cratespec in cratelist:
+                    editpath = cratespec[1]
+                    normpath = str(Path(path)).replace('\\', '/').rpartition('/')[0]  # fix windows paths
+                    # print(editpath)
+                    # print(normpath)
+                    if editpath == normpath:
                         not_core_path = False
                 if not_core_path:
                     cargo_toml_paths += [path]
@@ -191,7 +270,7 @@ def main():
 
         patches = []
         # extract the versions of crates to patch
-        for (crate, path) in cratelist.items():
+        for [crate, path] in cratelist:
             #print("extracting {}".format(path))
             patchinfo = PatchInfo(path + '/Cargo.toml', cratelist, crate)
             if not patchinfo.get_version():
@@ -202,15 +281,27 @@ def main():
         # now extract all the *other* crates
         for path in cargo_toml_paths:
             #print("{}".format(str(path)))
-            patchinfo = PatchInfo(path)
+            patchinfo = PatchInfo(path, cratelist)
             patches += [patchinfo]
 
-        print(VERSIONS)
-        for (name, ver) in VERSIONS.items():
-            print("{}: {} -> {}".format(name, ver, bump_version(ver)))
+        if args.bump:
+            for (name, ver) in VERSIONS.items():
+                print("{}: {} -> {}".format(name, ver, bump_version(ver)))
+        if args.local_paths or args.remote_paths:
+            print("Target crate list")
+            for (name, ver) in VERSIONS.items():
+                print("{}: {}".format(name, ver))
+
+        if args.bump:
+            mode = 'bump'
+        elif args.local_paths:
+            mode = 'to_local'
+        elif args.remote_paths:
+            mode = 'to_remote'
 
         for patch in patches:
-            patch.increment_versions()
+            patch.debug_mode(not args.wet_run)
+            patch.increment_versions(mode)
 
     if args.publish:
         # small quirk: if you're doing a utralib update, just use -u only.
@@ -224,19 +315,23 @@ def main():
             cmd = wet_cmd
         else:
             cmd = dry_cmd
-        for (crate, path) in cratelist.items():
+        for [crate, path] in cratelist:
             print("Publishing {} in {}".format(crate, path))
             try:
-                subprocess.run(cmd, cwd=path, check=True)
-            except subprocess.CalledProcessError:
+                subprocess.run(cmd, cwd=path, check=True, capture_output=True, encoding='utf-8')
+            except subprocess.CalledProcessError as err:
+                if 'already uploaded' in err.stderr:
+                    print("  Already uploaded, skipping to next module...")
+                    continue
+
                 print("Process failed, waiting for crates.io to update and retrying...")
-                time.sleep(10)
+                time.sleep(20)
                 # just try running it again
                 try:
                     subprocess.run(cmd, cwd=path, check=True)
                 except:
                     print("Retry failed, moving on anyways...")
-            time.sleep(10)
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()

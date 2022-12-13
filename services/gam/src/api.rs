@@ -43,6 +43,12 @@ impl GamObjectList {
             Err(item)
         }
     }
+    pub fn last(&self) -> Option<GamObjectType> {
+        match self.free {
+            0 => self.list[self.free],
+            _ => self.list[self.free-1],
+        }
+    }
 }
 
 #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Copy, Clone, Eq, PartialEq)]
@@ -201,6 +207,10 @@ pub(crate) enum Opcode {
     Bip39toBytes = 30,
     BytestoBip39 = 31,
     Bip39Suggestions = 32,
+
+    /// Allow main menu activation. Used by the PDDB to turn ungate the main menu once it is mounted.
+    /// This resolves race conditions that depend upon the PDDB configurations.
+    AllowMainMenu = 33,
 }
 
 // small wart -- we have to reset the size of a modal to max size for resize computations

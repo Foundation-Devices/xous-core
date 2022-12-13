@@ -632,7 +632,8 @@ impl<'a> ShellCmdApi<'a> for Test {
                             env.com.ship_mode().unwrap();
 
                             // now send the power off command
-                            env.com.power_off_soc().unwrap();
+                            let susres = susres::Susres::new_without_hook(&env.xns).unwrap();
+                            susres.immediate_poweroff().unwrap();
 
                             log::info!("CMD: ship mode now!");
                             // pause execution, nothing after this should be reachable
@@ -663,6 +664,11 @@ impl<'a> ShellCmdApi<'a> for Test {
                         }
                         Err(e) => log::error!("couldn't get input: {:?}", e),
                     }
+                }
+                "hpstate" => {
+                    let state = self.codec.poll_headphone_state();
+                    log::info!("{:?}", state);
+                    write!(ret, "{:?}", state).ok();
                 }
                 "ecup" => {
                     let ecup_conn = env.xns.request_connection_blocking("__ECUP server__").unwrap();
@@ -758,7 +764,8 @@ impl<'a> ShellCmdApi<'a> for Test {
                         env.com.ship_mode().unwrap();
 
                         // now send the power off command
-                        env.com.power_off_soc().unwrap();
+                        let susres = susres::Susres::new_without_hook(&env.xns).unwrap();
+                        susres.immediate_poweroff().unwrap();
 
                         log::info!("CMD: ship mode now!");
                         // pause execution, nothing after this should be reachable

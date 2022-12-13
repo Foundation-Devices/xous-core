@@ -37,6 +37,9 @@ tools/__pycache__
 # PDDB backup files
 *.pddb
 
+# PDDB for mtxcli (only for testing in hosted mode)
+/kernel/mtxcli
+
 # performance monitoring page table
 tools/ct_data/v2p.txt
 
@@ -44,8 +47,12 @@ tools/ct_data/v2p.txt
 /emulation/linux-server-rootfs.jffs2
 
 # don't record weirdnesses dealing with vscode
-/.vscode/
-/.vs/
+.vscode
+.vs
+settings.json
+
+# Emacs backup files
+*~
 
 # don't commit local modifications to the Renode filesystem template
 emulation/linux-server-rootfs.jffs2
@@ -71,5 +78,5 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.pyc
 MANIFEST
-

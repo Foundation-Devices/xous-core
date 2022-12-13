@@ -55,8 +55,12 @@ impl fmt::Display for MiniElfSection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Section {}: {} bytes loading @ {:08x} flags: {:?}",
-            self.name, self.size, self.virt, self.flags
+            "Section {:13} {:6} bytes loading into {:08x}..{:08x} flags: {:?}",
+            self.name,
+            self.size,
+            self.virt,
+            self.virt + self.size,
+            self.flags
         )
     }
 }
@@ -133,6 +137,10 @@ pub fn read_program<P: AsRef<Path>>(filename: P) -> Result<ProgramDescription, E
         fi.read_to_end(&mut b)
             .map_err(ElfReadError::ReadFileError)?;
     }
+    process_program(&b)
+}
+
+pub fn process_program(b: &[u8]) -> Result<ProgramDescription, ElfReadError> {
     let elf = ElfFile::new(&b).map_err(|x| ElfReadError::ParseElfError(x))?;
     let entry_point = elf.header.pt2.entry_point() as u32;
     let mut program_data = Cursor::new(Vec::new());
@@ -201,7 +209,7 @@ pub fn read_program<P: AsRef<Path>>(filename: P) -> Result<ProgramDescription, E
                 s.address()
             );
             continue;
-        } else if text_offset == 0 && s.size() != 0 {
+        } else if text_offset == 0 && (s.address() != 0 || s.size() != 0) {
             text_offset = s.address() as u32;
             text_size += s.size() as u32;
         } else {
@@ -276,6 +284,10 @@ pub fn read_minielf<P: AsRef<Path>>(filename: P) -> Result<MiniElf, ElfReadError
         fi.read_to_end(&mut b)
             .map_err(ElfReadError::ReadFileError)?;
     }
+    process_minielf(&b)
+}
+
+pub fn process_minielf(b: &[u8]) -> Result<MiniElf, ElfReadError> {
     let elf = ElfFile::new(&b).map_err(|x| ElfReadError::ParseElfError(x))?;
     let entry_point = elf.header.pt2.entry_point() as u32;
     let mut program_data = Cursor::new(Vec::new());

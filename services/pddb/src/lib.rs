@@ -20,6 +20,17 @@ pub(crate) static REFCOUNT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static POLLER_REFCOUNT: AtomicU32 = AtomicU32::new(0);
 use std::cell::RefCell;
 
+use core::ops::DerefMut;
+use core::mem::size_of;
+use std::convert::TryInto;
+use rkyv::{
+    archived_value,
+    de::deserializers::AllocDeserializer,
+    ser::{Serializer, serializers::WriteSerializer},
+    AlignedVec,
+    Deserialize,
+};
+
 #[derive(num_derive::FromPrimitive, num_derive::ToPrimitive, Debug)]
 pub enum CbOp {
     Change,
@@ -135,38 +146,69 @@ impl Pddb {
             self.cb_handle.replace(Some(handle));
         }
     }
-    /// This blocks until the PDDB is mounted by the end user. If `None` is specified for the poll_interval_ms,
-    /// A random interval between 1 and 2 seconds is chosen for the poll wait time. Randomizing the waiting time
-    /// helps to level out the task scheduler in the case that many threads are waiting on the PDDB simultaneously.
+    /// This blocks until the PDDB is mounted by the end user. It blocks using the deferred-response pattern,
+    /// so the blocking does not spin-wait; the caller does not consume CPU cycles.
     ///
     /// This is typically the API call one would use to hold execution of a service until the PDDB is mounted.
     pub fn is_mounted_blocking(&self) {
-        let ret = send_message(self.conn, Message::new_blocking_scalar(
-            Opcode::IsMounted.to_usize().unwrap(), 0, 0, 0, 0)).expect("couldn't execute IsMounted query");
-        match ret {
-            xous::Result::Scalar1(_code) => {
-                ()
-            },
-            _ => panic!("Internal error"),
+        loop {
+            let ret = send_message(self.conn, Message::new_blocking_scalar(
+                Opcode::IsMounted.to_usize().unwrap(), 0, 0, 0, 0)).expect("couldn't execute IsMounted query");
+            match ret {
+                xous::Result::Scalar2(code, _count) => {
+                    if code == 0 { // mounted successfully
+                        break;
+                    }
+                },
+                _ => panic!("Internal error"),
+            }
+        }
+    }
+    pub fn mount_attempted_blocking(&self) {
+        loop {
+            let ret = send_message(self.conn, Message::new_blocking_scalar(
+                Opcode::MountAttempted.to_usize().unwrap(), 0, 0, 0, 0)).expect("couldn't execute IsMounted query");
+            match ret {
+                xous::Result::Scalar2(code, _count) => {
+                    if code == 0 { // mounted successfully
+                        break;
+                    }
+                },
+                _ => panic!("Internal error"),
+            }
         }
     }
     /// Attempts to mount the system basis. Returns `true` on success, `false` on failure.
     /// This call may cause a password request box to pop up, in the case that the boot PIN is not currently cached.
-    pub fn try_mount(&self) -> bool {
+    ///
+    /// Returns:
+    ///   Ok(true) on successful mount
+    ///   Ok(false) on user-directed abort of mount
+    ///   Ok(usize) on system-forced abort of mount, with `count` failures
+    pub fn try_mount(&self) -> (bool, usize) {
         let ret = send_message(self.conn, Message::new_blocking_scalar(
-            Opcode::TryMount.to_usize().unwrap(), 0, 0, 0, 0)).expect("couldn't execute IsMounted query");
+            Opcode::TryMount.to_usize().unwrap(), 0, 0, 0, 0)).expect("couldn't execute TryMounted query");
         match ret {
-            xous::Result::Scalar1(code) => {
-                if code == 0 {false} else {true}
+            xous::Result::Scalar2(code, count) => {
+                if code == 0 {
+                    // mounted successfully
+                    (true, count)
+                } else if code == 1 {
+                    // user aborted
+                    (true, count)
+                } else {
+                    // system aborted with `count` retries
+                    (false, count)
+                }
             },
-            _ => panic!("Internal error"),
+            _ => panic!("TryMount unexpected return result"),
         }
     }
     /// Unmounts the PDDB. First attempts to unmount any open secret bases, and then finally unmounts
     /// the system basis. Returns `true` on success, `false` on failure.
     pub fn try_unmount(&self) -> bool {
         let ret = send_message(self.conn, Message::new_blocking_scalar(
-            Opcode::TryUnmount.to_usize().unwrap(), 0, 0, 0, 0)).expect("couldn't execute IsMounted query");
+            Opcode::TryUnmount.to_usize().unwrap(), 0, 0, 0, 0)).expect("couldn't execute TryUnmount query");
         match ret {
             xous::Result::Scalar1(code) => {
                 if code == 0 {false} else {true}
@@ -411,7 +453,7 @@ impl Pddb {
             PddbRequestCode::NoFreeSpace => Err(Error::new(ErrorKind::OutOfMemory, "No more space on disk")),
             PddbRequestCode::NotMounted => Err(Error::new(ErrorKind::ConnectionReset, "PDDB was unmounted")),
             PddbRequestCode::NotFound => Err(Error::new(ErrorKind::NotFound, "Dictionary or key was not found")),
-            _ => Err(Error::new(ErrorKind::Other, "Internal error"))
+            _ => Err(Error::new(ErrorKind::Other, format!("Unhandled return code: {:?}", response.result))),
         }
     }
 
@@ -550,6 +592,7 @@ impl Pddb {
             index: 0,
             code: PddbRequestCode::Uninit,
             token,
+            bulk_limit: None,
         };
         let mut buf = Buffer::into_buf(request)
             .or(Err(Error::new(ErrorKind::Other, "Xous internal error")))?;
@@ -560,7 +603,9 @@ impl Pddb {
         match response.code {
             PddbRequestCode::NoErr => (),
             PddbRequestCode::NotFound => return Err(Error::new(ErrorKind::NotFound, "dictionary not found")),
-            _ => return Err(Error::new(ErrorKind::Other, "Internal error")),
+            PddbRequestCode::AccessDenied => return Err(Error::new(ErrorKind::PermissionDenied, "concurrent operation in progress")),
+            PddbRequestCode::Uninit => return Err(Error::new(ErrorKind::ConnectionAborted, "Return code not set getting key count, server aborted?")),
+            _ => return Err(Error::new(ErrorKind::Other, "Internal error generating key count")),
         };
         // v2 key listing packs the key list into a larger [u8] field that should cut down on the number of messages
         // required to list a large dictionary by about a factor of 50.
@@ -582,7 +627,8 @@ impl Pddb {
             match response.retcode {
                 ArchivedPddbRetcode::Ok => (),
                 ArchivedPddbRetcode::AccessDenied => return Err(Error::new(ErrorKind::PermissionDenied, "KeyList facility locked by another process, try again later")),
-                _ => return Err(Error::new(ErrorKind::Other, "Internal Error")),
+                ArchivedPddbRetcode::Uninit => return Err(Error::new(ErrorKind::ConnectionAborted, "Return code not set fetching list, server aborted?")),
+                _ => return Err(Error::new(ErrorKind::Other, "Internal Error fetching list")),
             }
             // the [u8] data is structured as a packed list of u8-len + u8 data slice. The max length of
             // a PDDB key name is guaranteed to be shorter than a u8. If the length field is 0, then this
@@ -631,6 +677,7 @@ impl Pddb {
             index: 0,
             code: PddbRequestCode::Uninit,
             token,
+            bulk_limit: None,
         };
         let mut buf = Buffer::into_buf(request)
             .or(Err(Error::new(ErrorKind::Other, "Xous internal error")))?;
@@ -655,6 +702,7 @@ impl Pddb {
                 index,
                 code: PddbRequestCode::Uninit,
                 token,
+                bulk_limit: None,
             };
             let mut buf = Buffer::into_buf(request)
                 .or(Err(Error::new(ErrorKind::Other, "Xous internal error")))?;
@@ -729,8 +777,203 @@ impl Pddb {
             _ => Err(Error::new(ErrorKind::Other, "Return type not recognized")),
         }
     }
+
+    /// Retrieve an entire dictionary of data in a single call. Will return data records up to but not
+    /// over a total of `size_limit`. Keys that exceed the limit are still enumerated, but their
+    /// data sections are `None`, instead of `Some(Vec::<u8>)`.
+    /// Defaults to a size limit of up to 32k of bulk data returned, if it is not explicitly specified.
+    pub fn read_dict(&self, dict: &str, basis: Option<&str>, size_limit: Option<usize>) -> Result<Vec::<PddbKeyRecord>> {
+        // about the biggest we can move around in Precursor and not break heap.
+        const MAX_BUFLEN: usize = 32 * 1024;
+        // compromise between memory zeroing time and latency to send a message
+        const DEFAULT_LIMIT: usize = 32 * 1024;
+        /*
+           The operation proceeds in two phases. All operations use the DictBulkRead opcode.
+
+           The first phase establishes the read request. The caller first decides how many
+           memory pages it will use to return data from the PDDB main thread, and allocates
+           an appropriately-sized buffer.
+
+           It then serializes a `PddbDictRequest` structure, where the token and index fields are disregarded.
+
+           The main server then receives this, and if there are no tokens pending for `DictBulkRead`, it allocates
+           a 128-bit token for this transaction and records it, locking out any other potential requests.
+           If a token is already allocated, it responds immedaitely with an error code.
+
+           The main server proceeds to serialize keys out of the dictionary into `PddbKeyRecord` structures.
+           It will serialize exactly as many as can fit into the given buffer. In case the data is larger than
+           the allocated buffer, the data will always be returned as `None`; in case the data is larger than
+           the available space, the serialization stops, and the record is returned.
+
+           Subsequent calls from the client to the main server requries a `PddbDictRequest` structure
+           to be in the buffer, but only the "token" field is considered. The rest of the fields are disregarded;
+           changing the requested dictionary or other parameters has no impact on the call trajectory.
+
+           The PddbKeyRecords are manually packed into the memory messages with the following format:
+           Data slice:
+                - `code`: u32 containing the current transaction code
+                - `starting_key_index` u32 of the current index-offset that the return data starts at. Used as a sanity check.
+                - `len` u32 of number of records expected inside the return data structure.
+                - `total`: u32 with total number of keys to be transmitted (shouldn't change over the life of the session)
+                - `token`: [u32; 4] confirming or establishing the session token (shouldn't change over the life of the session)
+                First record start at data[24]:
+                    - `size` of archived struct: u32
+                    - `pos` of archived struct, relative to the current start: u32
+                    - data[u8] of length `size`
+                Next record start at data[24 + size]:
+                    - `size` of archived struct: u32
+                    - `pos` of archived struct, relative to the current start: u32
+                    - data[u8] of length `size`
+                If `size` and `pos` are both zero, then, there are no more valid records in the return structure.
+
+           The caller shall repeatedly call `DictBulkRead` until the `code` is `Last`, at which point the token
+           is deleted from the server, freeing it to service a new transaction. The caller should then collate the
+           results into the corresponding return vector.
+
+           If the caller fails to drain all the data, the server eventually times out and forgets the token.
+           The client will then get a "Busy" return code or "NotFound", depending on if they had fully initialized the
+           request structure for the subsequent calls.
+         */
+        // allocate buffer, which is shuffled back and forth to the PDDB server
+        let alloc_target = if let Some(size_limit) = size_limit {
+            if size_limit < 4096 {
+                4096
+            } else {
+                if size_limit > MAX_BUFLEN {
+                    MAX_BUFLEN
+                } else {
+                    // rounds *down* to the nearest page size, since it is a "guaranteed not to exceed" limit
+                    size_limit & !(4096 - 1)
+                }
+            }
+        } else {
+            DEFAULT_LIMIT
+        };
+        let mut msg_mem = xous::map_memory(
+            None,
+            None,
+            alloc_target,
+            xous::MemoryFlags::R | xous::MemoryFlags::W,
+        )
+        .expect("Likely OOM in allocating read_dict buffer");
+
+        // setup the request arguments
+        let mut request = PddbDictRequest {
+            basis_specified: basis.is_some(),
+            basis: xous_ipc::String::<BASIS_NAME_LEN>::from_str(basis.unwrap_or("")),
+            dict: xous_ipc::String::<DICT_NAME_LEN>::from_str(dict),
+            key: xous_ipc::String::<KEY_NAME_LEN>::new(),
+            index: 0,
+            token: [0u32; 4],
+            code: PddbRequestCode::BulkRead,
+            bulk_limit: Some(size_limit.unwrap_or(DEFAULT_LIMIT)),
+        };
+        // main loop
+        let mut ret = Vec::new();
+        let mut check_total_keys;
+        let mut check_key_index = 0;
+        loop {
+            let mut serializer = WriteSerializer::new(AlignedVec::new());
+            let pos = serializer.serialize_value(&request).unwrap();
+            let buf = serializer.into_inner();
+            msg_mem.as_slice_mut()[..buf.len()].copy_from_slice(buf.as_slice());
+            // initiate the request: assemble a MemoryMessage
+            let msg = xous::MemoryMessage {
+                id: Opcode::DictBulkRead.to_usize().unwrap(),
+                buf: msg_mem,
+                offset: xous::MemoryAddress::new(pos),
+                valid: xous::MemorySize::new(buf.len()),
+            };
+            // do a mutable lend to the server
+            let (_pos, _valid) = match xous::send_message(
+                self.conn,
+                Message::MutableBorrow(msg)
+            ) {
+                Ok(xous::Result::MemoryReturned(offset, valid)) => (offset, valid),
+                _ => return Err(Error::new(ErrorKind::Other, "Xous internal error"))
+            };
+            // unpack the return code. The result is not a single rkyv struct, it's hand-packed binary data. Unpack it.
+            let mut index = 0;
+            let mut header = BulkReadHeader::default();
+            header.deref_mut().copy_from_slice(
+                &msg_mem.as_slice()[index..index + size_of::<BulkReadHeader>()]
+            );
+            index += size_of::<BulkReadHeader>();
+            match FromPrimitive::from_u32(header.code).unwrap_or(PddbBulkReadCode::InternalError) {
+                PddbBulkReadCode::NotFound => {
+                    return Err(Error::new(ErrorKind::NotFound, format!("Bulk Read: dictionary '{}' not found", dict)))
+                }
+                PddbBulkReadCode::Busy => {
+                    return Err(Error::new(ErrorKind::TimedOut, "PDDB server busy or request timed out"))
+                }
+                PddbBulkReadCode::Streaming | PddbBulkReadCode::Last => {
+                    // --- unpack the received data
+                    // stash the token for future iterations
+                    request.token = header.token;
+                    check_total_keys = header.total;
+                    if check_key_index != header.starting_key_index {
+                        log::error!("local key index did not match remote key index: {}, {}", check_key_index, header.starting_key_index);
+                    }
+                    let mut key_count = 0;
+                    log::debug!("header: {:?}", header);
+                    while key_count < header.len {
+                        if index + size_of::<u32>() * 2 > msg_mem.len() {
+                            // quit if we don't have enough space to decode at least another two indices
+                            break;
+                        }
+                        let size = u32::from_le_bytes(msg_mem.as_slice()[index..index + size_of::<u32>()].try_into().unwrap());
+                        index += size_of::<u32>();
+                        let pos = u32::from_le_bytes(msg_mem.as_slice()[index..index + size_of::<u32>()].try_into().unwrap());
+                        index += size_of::<u32>();
+                        log::debug!("unpacking message at {}({})", size, pos);
+                        if size != 0 && pos != 0 {
+                            //log::info!("extract archive: {}, {}, {}, {}", index, size, pos, msg_mem.len());
+                            //log::info!("{:x?}", &msg_mem.as_slice::<u8>()[index..index + (size as usize)]);
+                            let archived = unsafe {
+                                archived_value::<PddbKeyRecord>(&msg_mem.as_slice()[index..index + (size as usize)], pos as usize)
+                            };
+                            //log::info!("increment index");
+                            index += size as usize;
+                            //log::info!("new index: {}", index);
+                            let key = match archived.deserialize(&mut AllocDeserializer) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    log::error!("deserialization error: {:?}", e);
+                                    panic!("deserializer error");
+                                },
+                            };
+                            //log::info!("pushing result");
+                            ret.push(key);
+                            key_count += 1;
+                            check_key_index += 1;
+                        } else {
+                            // we encountered a nil field, stop decoding
+                            log::info!("nil field");
+                            break;
+                        }
+                    }
+                    if key_count != header.len {
+                        log::error!("key count did not match number in header {}, {}", key_count, header.len);
+                    }
+                    // if this is the last block, quit the loop
+                    if header.code == (PddbBulkReadCode::Last as u32) {
+                        break;
+                    }
+                }
+                _ => {
+                    return Err(Error::new(ErrorKind::Other, "Bulk read invalid return value"))
+                }
+            }
+        }
+        if check_total_keys != check_key_index {
+            log::error!("Number of keys read does not match expected value: {}, {}", check_total_keys, check_key_index);
+        }
+        xous::unmap_memory(msg_mem).unwrap();
+        Ok(ret)
+    }
+
     /// Triggers a dump of the PDDB to host disk
-    #[cfg(any(feature="hosted"))]
+    #[cfg(not(target_os = "xous"))]
     pub fn dbg_dump(&self, name: &str) -> Result<()> {
         let ipc = PddbDangerousDebug {
             request: DebugRequest::Dump,
@@ -743,7 +986,7 @@ impl Pddb {
     }
     /// Triggers an umount/remount, forcing a read of the PDDB from disk back into the cache structures.
     /// It's a cheesy way to test a power cycle, without having to power cycle.
-    #[cfg(any(feature="hosted"))]
+    #[cfg(not(target_os = "xous"))]
     pub fn dbg_remount(&self) -> Result<()> {
         let ipc = PddbDangerousDebug {
             request: DebugRequest::Remount,

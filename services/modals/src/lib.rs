@@ -21,24 +21,45 @@ pub type TextValidationFn = fn(TextEntryPayload) -> Option<ValidatorErr>;
 pub struct AlertModalBuilder<'a> {
     prompt: String,
     validators: Vec<Option<TextValidationFn>>,
-    placeholders: Vec<Option<String>>,
+    placeholders: Vec<Option<(String, bool)>>,
     modals: &'a Modals,
 }
 
 impl<'a> AlertModalBuilder<'a> {
+    /// Placeholders, when provided, disappear on keypress or backspace; they persist with left/right arrows.
+    /// This is useful for suggesting an input, or explaining what a field does.
     pub fn field(
         &'a mut self,
         placeholder: Option<String>,
         validator: Option<TextValidationFn>,
     ) -> &'a mut Self {
         self.validators.push(validator);
-        self.placeholders.push(placeholder);
+        if let Some(p) = placeholder {
+            self.placeholders.push(Some((p, false)));
+        } else {
+            self.placeholders.push(None)
+        }
+        self
+    }
+    /// Placeholders provided in this method persist when any keys are pressed, instead of disappearing.
+    /// This is useful for "edit" functions.
+    pub fn field_placeholder_persist(
+        &'a mut self,
+        placeholder: Option<String>,
+        validator: Option<TextValidationFn>,
+    ) -> &'a mut Self {
+        self.validators.push(validator);
+        if let Some(p) = placeholder {
+            self.placeholders.push(Some((p, true)));
+        } else {
+            self.placeholders.push(None)
+        }
         self
     }
 
     pub fn build(&self) -> Result<TextEntryPayloads, xous::Error> {
         self.modals.lock();
-        let mut final_placeholders: Option<[Option<xous_ipc::String<256>>; 10]> = None;
+        let mut final_placeholders: Option<[Option<(xous_ipc::String<256>, bool)>; 10]> = None;
         let fields_amt = self.validators.len();
 
         if fields_amt == 0 {
@@ -49,7 +70,7 @@ impl<'a> AlertModalBuilder<'a> {
 
         match self.placeholders.len() {
             1.. => {
-                let mut pl: [Option<xous_ipc::String<256>>; 10] = Default::default();
+                let mut pl: [Option<(xous_ipc::String<256>, bool)>; 10] = Default::default();
 
                 if fields_amt != self.placeholders.len() {
                     log::warn!("can't have more fields than placeholders");
@@ -58,8 +79,8 @@ impl<'a> AlertModalBuilder<'a> {
                 }
 
                 for (index, placeholder) in self.placeholders.iter().enumerate() {
-                    if let Some(string) = placeholder {
-                        pl[index] = Some(xous_ipc::String::from_str(&string))
+                    if let Some((string, persist)) = placeholder {
+                        pl[index] = Some((xous_ipc::String::from_str(&string), *persist))
                     } else {
                         pl[index] = None
                     }
@@ -302,11 +323,41 @@ impl Modals {
             start_work: start,
             end_work: end,
             current_work: current,
+            user_interaction: false,
+            step: 1,
         };
         let buf = Buffer::into_buf(spec).or(Err(xous::Error::InternalError))?;
         buf.lend(self.conn, Opcode::StartProgress.to_u32().unwrap())
             .or(Err(xous::Error::InternalError))?;
         Ok(())
+    }
+
+    pub fn slider(
+        &self,
+        title: &str,
+        start: u32,
+        end: u32,
+        current: u32,
+        step: u32,
+    ) -> Result<u32, xous::Error> {
+        self.lock();
+        let spec = ManagedProgress {
+            token: self.token,
+            title: xous_ipc::String::from_str(title),
+            start_work: start,
+            end_work: end,
+            current_work: current,
+            user_interaction: true,
+            step: step,
+        };
+        let mut buf = Buffer::into_buf(spec).or(Err(xous::Error::InternalError))?;
+        buf.lend_mut(self.conn, Opcode::Slider.to_u32().unwrap())
+            .or(Err(xous::Error::InternalError))?;
+
+        let orig = buf.to_original::<SliderPayload, _>().unwrap();
+
+        self.unlock();
+        Ok(orig.0)
     }
 
     /// note that this API is not atomically token-locked, so, someone could mess with the progress bar state
@@ -334,12 +385,15 @@ impl Modals {
         Ok(())
     }
 
-    /// close the progress bar, regardless of the current state
+    /// Close the progress bar, regardless of the current state
+    /// This is a blocking call, because you want the GAM to revert focus back to your context before you
+    /// continue with any drawing operations. Otherwise, they could be missed as the modal is still covering
+    /// your window.
     pub fn finish_progress(&self) -> Result<(), xous::Error> {
         self.lock();
         send_message(
             self.conn,
-            Message::new_scalar(
+            Message::new_blocking_scalar(
                 Opcode::StopProgress.to_usize().unwrap(),
                 self.token[0] as usize,
                 self.token[1] as usize,

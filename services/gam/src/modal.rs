@@ -56,7 +56,7 @@ pub trait ActionApi {
     fn close(&mut self) {}
     fn is_password(&self) -> bool { false }
     /// navigation is one of '∴' | '←' | '→' | '↑' | '↓'
-    fn key_action(&mut self, _key: char) -> (Option<ValidatorErr>, bool) {(None, true)}
+    fn key_action(&mut self, _key: char) -> Option<ValidatorErr> {None}
     fn set_action_opcode(&mut self, _op: u32) {}
 }
 
@@ -92,6 +92,7 @@ pub struct TextEntryPayload {
     dirty: bool,
     pub content: String::<256>,
     pub placeholder: Option<String::<256>>,
+    pub placeholder_persist: bool,
 }
 
 impl TextEntryPayload {
@@ -100,11 +101,12 @@ impl TextEntryPayload {
             dirty: Default::default(),
             content: Default::default(),
             placeholder: Default::default(),
+            placeholder_persist: false,
         }
     }
 
     pub fn new_with_fields(content: String::<256>, placeholder: Option<String::<256>>) -> Self {
-        TextEntryPayload { dirty: false, content: content, placeholder: placeholder }
+        TextEntryPayload { dirty: false, content: content, placeholder: placeholder, placeholder_persist: false }
     }
     /// Ensures that 0's are written to the storage of this struct, and not optimized out; important for password fields.
     pub fn volatile_clear(&mut self) {
@@ -112,6 +114,14 @@ impl TextEntryPayload {
     }
     pub fn as_str(&self) -> &str {
         self.content.as_str().expect("couldn't convert textentry string")
+    }
+}
+
+#[derive(Debug, Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct SliderPayload(pub u32);
+impl SliderPayload {
+    pub fn new(value: u32) -> Self {
+        SliderPayload(value)
     }
 }
 
@@ -478,16 +488,9 @@ impl<'a> Modal<'a> {
         for &k in keys.iter() {
             if k != '\u{0}' {
                 log::debug!("got key '{}'", k);
-                let (err, close) = self.action.key_action(k);
+                let err = self.action.key_action(k);
                 if let Some(err_msg) = err {
                     self.modify(None, None, false, Some(err_msg.to_str()), false, None);
-                } else {
-                    if close {
-                        // if it's a "close" button, invoke the GAM to put our box away
-                        self.gam.relinquish_focus().unwrap();
-                        xous::yield_slice();
-                        break; // don't process any more keys after a close message
-                    }
                 }
             }
         }

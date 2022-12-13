@@ -4,6 +4,10 @@ use graphics_server::api::*;
 
 use core::fmt::Write;
 
+// This structure needs to be "shallow copy capable" so we can use it with
+// the enum_actions API to update the progress state in an efficient manner.
+// Thus it does not include its own GAM reference; instead we create one on
+// the fly when needed.
 #[derive(Debug, Copy, Clone)]
 pub struct Slider {
     pub min: u32,
@@ -43,6 +47,11 @@ impl Slider {
             show_legend,
         }
     }
+
+    pub fn set_is_progressbar(&mut self, setting: bool) {
+        self.is_progressbar = setting;
+    } 
+
     pub fn set_is_password(&mut self, setting: bool) {
         // this will cause text to be inverted. Untrusted entities can try to set this,
         // but the GAM should defeat this for dialog boxes outside of the trusted boot
@@ -163,7 +172,7 @@ impl ActionApi for Slider {
         draw_list.push(GamObjectType::Rect(inner_rect)).unwrap();
         modal.gam.draw_list(draw_list).expect("couldn't execute draw list");
     }
-    fn key_action(&mut self, k: char) -> (Option<ValidatorErr>, bool) {
+    fn key_action(&mut self, k: char) -> Option<ValidatorErr> {
         log::trace!("key_action: {}", k);
         if !self.is_progressbar {
             match k {
@@ -185,20 +194,33 @@ impl ActionApi for Slider {
                     // ignore null messages
                 }
                 '∴' | '\u{d}' => {
-                    send_message(self.action_conn,
-                        xous::Message::new_scalar(self.action_opcode as usize, self.action_payload as usize, 0, 0, 0)).expect("couldn't pass on action payload");
-                    return(None, true)
+                    // relinquish focus before returning the result
+                    let gam = crate::Gam::new(&xous_names::XousNames::new().unwrap()).unwrap();
+                    gam.relinquish_focus().unwrap();
+                    xous::yield_slice();
+
+                    let ret_payload = SliderPayload(self.action_payload);
+
+                    let buf = Buffer::into_buf(ret_payload).expect("couldn't convert message to payload");
+                    buf.send(self.action_conn, self.action_opcode).map(|_| ()).expect("couldn't send action message");
+
+                    return None;
                 }
                 _ => {
                     // ignore all other messages
                 }
             }
-            (None, false)
+            None
         } else {
             if k == '🛑' { // use the "stop" emoji as a signal that we should close the progress bar
-                (None, true)
+                // relinquish focus on stop
+                let gam = crate::Gam::new(&xous_names::XousNames::new().unwrap()).unwrap();
+                gam.relinquish_focus().unwrap();
+                xous::yield_slice();
+
+                None
             } else {
-                (None, false)
+                None
             }
         }
     }

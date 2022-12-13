@@ -55,6 +55,7 @@ pub struct TextEntry {
     /// track if keys were hit since initialized: this allows us to clear the default text,
     /// instead of having it re-appear every time the text area is cleared
     keys_hit: [bool; MAX_FIELDS as usize],
+    // gam: crate::Gam, // no GAM field because this needs to be a clone-capable structure. We create a GAM handle when we need it.
 }
 
 impl Default for TextEntry {
@@ -98,12 +99,18 @@ impl TextEntry {
         }
     }
 
-    pub fn reset_action_payloads(&mut self, fields: u32, placeholders: Option<[Option<xous_ipc::String<256>>; 10]>) {
+    pub fn reset_action_payloads(&mut self, fields: u32, placeholders: Option<[Option<(xous_ipc::String<256>, bool)>; 10]>) {
         let mut payload = vec![TextEntryPayload::default(); fields as usize];
 
         if let Some(placeholders) = placeholders {
             for (index, element) in payload.iter_mut().enumerate() {
-                element.placeholder = placeholders[index];
+                if let Some((p, persist)) = placeholders[index] {
+                    element.placeholder = Some(p);
+                    element.placeholder_persist = persist;
+                } else {
+                    element.placeholder = None;
+                    element.placeholder_persist = false;
+                }
             }
         }
 
@@ -358,7 +365,7 @@ impl ActionApi for TextEntry {
             current_height += self.field_height.get();
         }
     }
-    fn key_action(&mut self, k: char) -> (Option<ValidatorErr>, bool) {
+    fn key_action(&mut self, k: char) -> Option<ValidatorErr> {
         // needs to be a reference, otherwise we're operating on a copy of the payload!
         let payload = &mut self.action_payloads[self.selected_field as usize];
 
@@ -415,7 +422,7 @@ impl ActionApi for TextEntry {
                 if let Some(validator) = self.validator {
                     if let Some(err_msg) = validator(*payload, self.action_opcode) {
                         payload.content.clear(); // reset the input field
-                        return (Some(err_msg), false);
+                        return Some(err_msg);
                     }
                 }
 
@@ -427,6 +434,11 @@ impl ActionApi for TextEntry {
                         }
                     }
                 }
+                // relinquish focus before returning the result
+                let gam = crate::Gam::new(&xous_names::XousNames::new().unwrap()).unwrap();
+                gam.relinquish_focus().unwrap();
+                xous::yield_slice();
+
                 let mut payloads: TextEntryPayloads = Default::default();
                 payloads.1 = self.max_field_amount as usize;
                 payloads.0[..self.max_field_amount as usize].copy_from_slice(&self.action_payloads[..self.max_field_amount as usize]);
@@ -438,7 +450,7 @@ impl ActionApi for TextEntry {
                 }
                 self.keys_hit[self.selected_field as usize] = false;
 
-                return (None, true)
+                return None;
             }
             '↑' => {
                 if can_move_upwards {
@@ -461,6 +473,10 @@ impl ActionApi for TextEntry {
                     let tts = tts_frontend::TtsFrontend::new(&xns).unwrap();
                     tts.tts_blocking(locales::t!("input.delete-tts", xous::LANG)).unwrap();
                 }
+                if payload.placeholder_persist && payload.placeholder.is_some() && payload.content.len() == 0 {
+                    // copy the placeholder into the content string before processing the backspace
+                    payload.content.append(payload.placeholder.unwrap().to_str()).ok();
+                }
                 // coded in a conservative manner to avoid temporary allocations that can leave the plaintext on the stack
                 if payload.content.len() > 0 { // don't backspace if we have no string.
                     let mut temp_str = String::<256>::from_str(payload.content.as_str().unwrap());
@@ -474,6 +490,13 @@ impl ActionApi for TextEntry {
                 }
             }
             _ => { // text entry
+                if !self.keys_hit[self.selected_field as usize]
+                && payload.placeholder_persist
+                && payload.placeholder.is_some()
+                && payload.content.len() == 0 {
+                    // copy the placeholder into the content string before processing the backspace
+                    payload.content.append(payload.placeholder.unwrap().to_str()).ok();
+                }
                 self.keys_hit[self.selected_field as usize] = true;
                 #[cfg(feature="tts")]
                 {
@@ -492,6 +515,6 @@ impl ActionApi for TextEntry {
 
             }
         }
-        (None, false)
+        None
     }
 }

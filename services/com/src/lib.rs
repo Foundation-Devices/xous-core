@@ -67,6 +67,7 @@ impl Com {
     pub fn conn(&self) -> CID {self.conn}
     pub fn getop_backlight(&self) -> u32 {Opcode::SetBackLight.to_u32().unwrap()}
 
+    #[deprecated(note = "Uses susres.immediate_poweroff() instead, as power sequencing requirements have changed.")]
     pub fn power_off_soc(&self) -> Result<(), xous::Error> {
         send_message(self.conn,
             Message::new_scalar(Opcode::PowerOffSoc.to_usize().unwrap(), 0, 0, 0, 0)
@@ -600,7 +601,10 @@ impl Com {
                 log::error!("got an error code in fetching the RSSI data: 0x{:x}", rssi_usize);
                 Err(xous::Error::UnknownError)
             } else {
-                Ok((rssi_usize & 0xFF) as u8)
+                // must convert raw code to signal strength here
+                let rssi = 110u8 - (rssi_usize & 0xFF) as u8;
+                log::debug!("RSSI (lib): -{}dBm", rssi);
+                Ok(rssi)
             }
         } else {
             Err(xous::Error::InternalError)

@@ -55,9 +55,7 @@ pub const BASE_QUANTA_MS: u32 = 10;
 pub const BOOKEND_START: &'static str = "_|TT|_";
 pub const BOOKEND_END: &'static str = "_|TE|_";
 
-#[cfg(any(feature="hosted",
-    not(any(feature="precursor", feature="renode"))
-))]
+#[cfg(not(target_os = "xous"))]
 use core::sync::atomic::AtomicU64;
 
 // Secretly, you can change this by setting the XOUS_SEED environment variable.
@@ -66,9 +64,7 @@ use core::sync::atomic::AtomicU64;
 // The code that reads the varable this is all the way over in xous-rs\src\arch\hosted\mod.rs#29, and
 // it's glommed onto some other static process initialization code because I don't fully understand
 // what's going on over there.
-#[cfg(any(feature="hosted",
-    not(any(feature="precursor", feature="renode"))
-))]
+#[cfg(not(target_os = "xous"))]
 pub static TESTING_RNG_SEED: AtomicU64 = AtomicU64::new(0);
 
 pub mod exceptions;
@@ -464,6 +460,9 @@ pub enum Result {
     /// the caller.
     NewProcess(ProcessStartup),
 
+    /// 20: A scalar with five values
+    Scalar5(usize, usize, usize, usize, usize),
+
     UnknownResult(usize, usize, usize, usize, usize, usize, usize),
 }
 
@@ -527,6 +526,7 @@ impl Result {
                 0,
             ],
             Result::NewProcess(p) => Self::add_opcode(19, p.into()),
+            Result::Scalar5(a, b, c, d, e) => [15, *a, *b, *c, *d, *e, 0, 0],
             Result::UnknownResult(arg1, arg2, arg3, arg4, arg5, arg6, arg7) => {
                 [usize::MAX, *arg1, *arg2, *arg3, *arg4, *arg5, *arg6, *arg7]
             }
@@ -604,6 +604,7 @@ impl Result {
             17 => Result::None,
             18 => Result::MemoryReturned(MemorySize::new(src[1]), MemorySize::new(src[2])),
             19 => Result::NewProcess(src.into()),
+            20 => Result::Scalar5(src[1], src[2], src[3], src[4], src[5]),
             _ => Result::UnknownResult(src[0], src[1], src[2], src[3], src[4], src[5], src[6]),
         }
     }

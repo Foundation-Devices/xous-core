@@ -51,9 +51,7 @@ impl Susres {
     // of concurrency introduced by suspend/resume, as its underlying IPC mechanisms are quite
     // different and have a lot of overhead; it seems like the system goes into a form of deadlock
     // during boot when all the hosted mode servers try to connect. This isn't an issue on real hardware.
-    #[cfg(any(feature="hosted",
-        not(any(feature="precursor", feature="renode", feature="hosted"))
-    ))]
+    #[cfg(not(target_os = "xous"))]
     /// When created, the `susres` object can be configured with a `SuspendOrder` to enforce
     /// sequencing rules in shutdown. It also requires arguments to define a callback which is
     /// pinged when a suspend event arrives. The callback takes the form of a `CID, discriminant`
@@ -179,6 +177,13 @@ impl Susres {
                 Message::new_scalar(Opcode::RebootCpuConfirm.to_usize().unwrap(), 0, 0, 0, 0)
             ).map(|_|())
         }
+    }
+
+    /// Pulls power from the SoC without attempting to save state
+    pub fn immediate_poweroff(&self) -> Result<(), xous::Error> {
+        send_message(self.conn,
+            Message::new_scalar(Opcode::PowerOff.to_usize().unwrap(), 0, 0, 0, 0)
+        ).map(|_|())
     }
 }
 fn drop_conn(sid: xous::SID) {

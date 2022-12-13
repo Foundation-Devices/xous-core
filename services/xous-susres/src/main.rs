@@ -212,6 +212,12 @@ mod implementation {
         pub fn set_reboot_vector(&mut self, vector: u32) {
             self.reboot_csr.wfo(utra::reboot::ADDR_ADDR, vector);
         }
+        pub fn force_power_off(&mut self) {
+            loop {
+                self.csr.wfo(utra::susres::POWERDOWN_POWERDOWN, 1);
+                xous::yield_slice();
+            } // block forever here
+        }
 
         pub fn setup_timeout_csr(&mut self, cid: xous::CID) -> Result<(), xous::Error> {
             xous::send_message(cid,
@@ -430,8 +436,8 @@ mod implementation {
 
 }
 
-#[cfg(any(feature="hosted",
-    not(any(feature="precursor", feature="renode", feature="hosted")) // default for crates.io
+#[cfg(any(not(target_os = "xous"),
+    not(any(feature="precursor", feature="renode", not(target_os = "xous"))) // default for crates.io
 ))]
 mod implementation {
     use num_traits::ToPrimitive;
@@ -444,6 +450,7 @@ mod implementation {
         }
         pub fn reboot(&self, _reboot_soc: bool) {}
         pub fn set_reboot_vector(&self, _vector: u32) {}
+        pub fn force_power_off(&mut self) {}
         pub fn do_suspend(&mut self, _forced: bool) {
         }
         pub fn do_resume(&mut self) -> bool {
@@ -493,8 +500,8 @@ pub fn timeout_thread(sid0: usize, sid1: usize, sid2: usize, sid3: usize) {
             Some(TimeoutOpcode::SetCsr) => msg_scalar_unpack!(msg, base, _, _, _, {
                 csr = Some(CSR::new(base as *mut u32));
             }),
-            #[cfg(any(feature="hosted",
-              not(any(feature="precursor", feature="renode", feature="hosted")) // default for crates.io
+            #[cfg(any(not(target_os = "xous"),
+              not(any(feature="precursor", feature="renode", not(target_os = "xous"))) // default for crates.io
             ))]
             Some(TimeoutOpcode::SetCsr) => msg_scalar_unpack!(msg, _base, _, _, _, {
                 // ignore the opcode in hosted mode
@@ -808,6 +815,9 @@ fn main() -> ! {
                 Some(Opcode::SuspendDeny) => {
                     allow_suspend = false;
                 },
+                Some(Opcode::PowerOff) => {
+                    susres_hw.force_power_off();
+                }
                 Some(Opcode::Quit) => {
                     break
                 }
@@ -856,7 +866,7 @@ fn send_event(cb_conns: &Vec::<ScalarCallback>, order: crate::api::SuspendOrder)
     log::info!("Sending suspend to {:?} stage", order);
     /*
     // abortive attempt to get suspend to shut down the system. Doesn't work, results in a panic because too many messages are still moving around.
-    #[cfg(any(feature="hosted"))]
+    #[cfg(not(target_os = "xous"))]
     {
         if order == crate::api::SuspendOrder::Last {
             let tt_conn = xous::connect(xous::SID::from_bytes(b"ticktimer-server").unwrap()).unwrap();

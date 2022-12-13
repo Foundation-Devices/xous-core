@@ -12,11 +12,10 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Time;
-using Antmicro.Renode.Utilities;
 
 // This project is a reimplementation of the OpenCoresI2C module.
 
-namespace Antmicro.Renode.Peripherals.I2C
+namespace Antmicro.Renode.Peripherals.I2C.Betrusted
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord)]
     public class BetrustedSocI2C : SimpleContainer<II2CPeripheral>, IDoubleWordPeripheral, IKnownSize
@@ -163,7 +162,7 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         private void FinishTransaction()
         {
-            machine.ClockSource.RemoveClockEntry(FinishTransaction);
+            machine.ClockSource.TryRemoveClockEntry(FinishTransaction);
             if (shouldSendTxRxIrq)
             {
                 shouldSendTxRxIrq = false;

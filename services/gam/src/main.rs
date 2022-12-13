@@ -108,7 +108,7 @@ fn wrapped_main() -> ! {
     let mut did_test = false; // allow one go at the test pattern
     log::trace!("entering main loop");
 
-    #[cfg(any(feature="hosted"))]
+    #[cfg(not(target_os = "xous"))]
     {
         log::info!("********************************************************************************");
         log::info!("USAGE:");
@@ -663,6 +663,10 @@ fn wrapped_main() -> ! {
                     *returned = Some(xous_ipc::String::from_str(word));
                 }
                 buffer.replace(spec).unwrap();
+            }
+            Some(Opcode::AllowMainMenu) => {
+                context_mgr.allow_mainmenu();
+                xous::return_scalar(msg.sender, 0).ok();
             }
             Some(Opcode::Quit) => break,
             None => {log::error!("unhandled message {:?}", msg);}
