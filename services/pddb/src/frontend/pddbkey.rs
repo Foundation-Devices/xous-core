@@ -6,6 +6,7 @@ use num_traits::*;
 use std::io::{Result, Error, ErrorKind};
 use std::io::{Read, Write, Seek, SeekFrom};
 
+#[derive(Debug)]
 pub struct PddbKey<'a> {
     pub(crate) token: ApiToken,
     /// position in the key's data "stream"

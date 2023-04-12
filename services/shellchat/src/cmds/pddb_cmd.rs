@@ -5,6 +5,7 @@ use xous_ipc::String;
 #[allow(unused_imports)]
 use std::io::{Write, Read, Seek, SeekFrom};
 use core::fmt::Write as FmtWrite;
+use std::time::Instant;
 
 #[cfg(any(feature="shellperf", not(target_os = "xous")))]
 const TEST_DICT: &'static str = "perftest";
@@ -1102,153 +1103,36 @@ impl<'a> ShellCmdApi<'a> for PddbCmd {
                 // note that this feature only works in hosted mode
                 #[cfg(feature="pddbtest")]
                 "test" => {
-                    let bname = tokens.next();
-                    // zero-length key test
-                    let test_handle = pddb::Pddb::new();
-                    // build a key, but don't write to it.
-                    let _ = test_handle.get(
-                        "test",
-                        "zerolength",
-                        None, true, true,
-                        Some(8),
-                        None::<fn()>,
-                    ).expect("couldn't build empty key");
-                    self.pddb.sync().unwrap();
-                    if let Some(name) = bname {
-                        match self.pddb.lock_basis(name) {
-                            Ok(_) => log::info!("basis {} lock successful", name),
-                            Err(e) => log::info!("basis {} could not be unmounted: {:?}", name, e),
-                        }
-                    }
-                    self.pddb.dbg_remount().unwrap();
-                    if let Some(name) = bname {
-                        match self.pddb.unlock_basis(name, None) {
-                            Ok(_) => log::info!("basis {} unlocked successfully", name),
-                            Err(e) => log::info!("basis {} could not be unlocked: {:?}", name, e),
-                        }
-                    }
-                    self.pddb.dbg_dump("std_test1").unwrap();
-                    write!(ret, "dumped std_test1\n").unwrap();
-                    log::info!("finished zero-length alloc");
+                    // TODO Comment how to use this
+                    log::error!("hello world");
 
-                    // delete this dictionary with a zero-length key.
-                    self.pddb.delete_dict("test", None).expect("couldn't delete test dictionary");
-                    self.pddb.sync().unwrap();
-                    self.pddb.dbg_dump("std_test2").unwrap();
-                    write!(ret, "dumped std_test2\n").unwrap();
-                    log::info!("finished dict delete with zero-length key");
+                    let mut data = [0; 1024];
+                    for (i, x) in data.iter_mut().enumerate() {
+                        *x = i as u8;
+                    }
 
-                    // seek test - a bunch of terrible, handcrafted test cases to exercise Start, Current, End cases of seeking.
-                    let test_handle = pddb::Pddb::new();
-                    // build a key, but don't write to it.
-                    let mut seekwrite = test_handle.get(
-                        "test",
-                        "seekwrite",
-                        None, true, true,
-                        Some(64),
-                        Some(|| {
-                            log::info!("test:seekwrite key was unmounted");
-                        })
-                    ).expect("couldn't build empty key");
-                    // 1, 1, 1, 1
-                    log::info!("wrote {} bytes at offset 0",
-                        seekwrite.write(&[1, 1, 1, 1]).unwrap()
-                    );
-                    log::info!("seek to {}",
-                        seekwrite.seek(SeekFrom::Current(-2)).unwrap()
-                    );
-                    // 1, 1, 2, 2, 2, 2
-                    log::info!("wrote {} bytes at offset 2",
-                        seekwrite.write(&[2, 2, 2, 2]).unwrap()
-                    );
-                    if let Some(name) = bname {
-                        match self.pddb.lock_basis(name) {
-                            Ok(_) => log::info!("basis {} lock successful", name),
-                            Err(e) => log::info!("basis {} could not be unmounted: {:?}", name, e),
-                        }
+                    let pddb = pddb::Pddb::new();
+                    let result = pddb.create_basis("example_basis");
+                    log::error!("create_basis: {result:?}");
+                    result.unwrap();
+                    let start = Instant::now();
+                    for i in 0..100 {
+                        let key = pddb.get(&format!("example_dict_{i}"), &format!("example_key_{i}"), None, true, true, None, None::<fn()>);
+                        log::error!("key: {key:?}");
+                        let result = key.unwrap().write_all(&data);
+                        log::error!("write_all: {result:?}");
+                        result.unwrap();
+                        let result = pddb.sync();
+                        log::error!("sync: {result:?}");
+                        result.unwrap();
                     }
-                    if let Some(name) = bname {
-                        match self.pddb.unlock_basis(name, None) {
-                            Ok(_) => log::info!("basis {} unlocked successfully", name),
-                            Err(e) => log::info!("basis {} could not be unlocked: {:?}", name, e),
-                        }
-                    }
-                    // 1, 1, 2, 2, 2, 2, 0, 0, 3, 3
-                    log::info!("seek to {}",
-                        seekwrite.seek(SeekFrom::Start(8)).unwrap()
-                    );
-                    log::info!("wrote {} bytes at offset 8",
-                        seekwrite.write(&[3, 3]).unwrap()
-                    );
-                    // 1, 1, 2, 2, 2, 2, 0, 10, 3, 3
-                    log::info!("seek to {}",
-                        seekwrite.seek(SeekFrom::End(-3)).unwrap()
-                    );
-                    log::info!("wrote {} bytes at offset 8",
-                        seekwrite.write(&[10]).unwrap()
-                    );
-                    let mut readout = [0u8; 64];
-                    let check = [1u8, 1u8, 2u8, 2u8, 2u8, 2u8, 0u8, 10u8, 3u8, 3u8];
-                    seekwrite.seek(SeekFrom::Start(0)).unwrap();
-                    log::info!("read {} bytes from 0", seekwrite.read(&mut readout).unwrap());
-                    let mut pass = true;
-                    for (i, (&src, &dst)) in readout.iter().zip(check.iter()).enumerate() {
-                        if src != dst {
-                            log::info!("mismatch at {}: read {}, check {}", i, src, dst);
-                            pass = false;
-                        }
-                    }
-                    if pass {
-                        log::info!("check 1 PASSED");
-                    } else {
-                        log::info!("check 1 FAILED");
-                    }
-                    seekwrite.seek(SeekFrom::Start(7)).unwrap();
-                    let mut readout2 = [0u8];
-                    log::info!("read {} bytes from 7", seekwrite.read(&mut readout2).unwrap());
-                    log::info!("readout2: {}, should be 10", readout2[0]);
-
-                    self.pddb.sync().unwrap();
-                    self.pddb.dbg_remount().unwrap();
-                    self.pddb.dbg_dump("std_test3").unwrap();
-                    write!(ret, "dumped std_test3\n").unwrap();
-
-                    // creeping extend test
-                    self.pddb.delete_key("wlan.networks", "testkey", None).ok();
-                    let mut testdata = "".to_string();
-                    let mut len = 0;
-                    for i in 0..20 {
-                        let mut testkey = self.pddb.get("wlan.networks", "testkey", None,
-                        false, true, None, None::<fn()>).expect("couldn't make test key");
-                        testdata.push_str(&i.to_string());
-                        // testkey.seek(SeekFrom::Start(0)).ok();
-                        len = testkey.write(testdata.as_bytes()).expect("couldn't write");
-                        // self.pddb.sync().ok();
-                        self.pddb.dbg_remount().unwrap();
-                    }
-                    let mut testkey_rbk = self.pddb.get("wlan.networks", "testkey", None,
-                    false, true, None, None::<fn()>).expect("couldn't make test key");
-                    let mut rbkdata = Vec::<u8>::new();
-                    let rlen = testkey_rbk.read_to_end(&mut rbkdata).expect("couldn't read back");
-                    if len != rlen {
-                        log::info!("failed: written length and read back length of extended key does not match {} vs {}", len, rlen);
-                        log::info!("written: {:x?}", testdata.as_bytes());
-                        log::info!("readback: {:x?}", &rbkdata);
-                    } else {
-                        let mut passed = true;
-                        let wcheck = testdata.as_bytes();
-                        for (&a, &b) in wcheck.iter().zip(rbkdata.iter()) {
-                            if a != b {
-                                log::info!("error: a: {}, b: {}", a, b);
-                                passed = false;
-                            }
-                        }
-                        if passed {
-                            log::info!("extension test passed");
-                        } else {
-                            log::info!("extension test failed");
-                        }
-                    }
+                    let end = Instant::now();
+                    log::error!("total time spent: {}ms", end.duration_since(start).as_micros() as f64 / 1000.0);
+                    // TODO Measure the time
+                    // Do two things: storing one big key-pair value and storing a bunch of small ones
+                    // Maybe time storing one byte, two bytes, 10 bytes, 100 bytes, 1k bytes, and then also time how long it takes
+                    // to do this Y times
+                    log::error!("done writing");
                 }
                 "prune" => {
                     #[cfg(not(target_os = "xous"))]
