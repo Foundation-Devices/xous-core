@@ -1,5 +1,5 @@
 [package]
-name = "pddb"
+name = "pddb-core"
 version = "0.1.0"
 authors = ["bunnie <bunnie@kosagi.com>"]
 edition = "2018"
@@ -40,10 +40,9 @@ zeroize_derive = "1.1.0"
 # bcrypt
 blowfish = { version = "0.9.1", features = ["bcrypt"] }
 
+# TODO Get rid of locales as well
 # UX (for password entry and notifications)
-gam = {path="../gam"}
 locales = {path = "../../locales"}
-modals = {path="../modals"}
 
 utralib = { version = "0.1.17", optional = true, default-features = false }
 
