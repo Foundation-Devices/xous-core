@@ -2796,6 +2796,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "pddb-core"
+version = "0.1.0"
+dependencies = [
+ "aes 0.8.1",
+ "aes-gcm-siv",
+ "bitfield",
+ "bitflags",
+ "blowfish 0.9.1",
+ "cipher 0.4.3",
+ "digest 0.9.0",
+ "gam",
+ "hex 0.4.3",
+ "hkdf",
+ "llio",
+ "locales",
+ "log",
+ "modals",
+ "num-derive",
+ "num-traits",
+ "perflib",
+ "rand 0.7.3",
+ "rand_chacha 0.3.1",
+ "rand_core 0.5.1",
+ "rkyv",
+ "root-keys",
+ "sha2 0.9.8",
+ "spinor",
+ "subtle",
+ "trng",
+ "tts-frontend",
+ "utralib",
+ "xous 0.9.39 (registry+https://github.com/rust-lang/crates.io-index)",
+ "xous-api-log",
+ "xous-api-names",
+ "xous-api-susres",
+ "xous-api-ticktimer",
+ "xous-ipc 0.9.39 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zeroize",
+ "zeroize_derive",
+]
+
+[[package]]
 name = "pem"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
