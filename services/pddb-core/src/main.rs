@@ -1818,7 +1818,7 @@ fn wrapped_main() -> ! {
                         .expect("couldn't show notification");
                     continue;
                 }
-                match pddb_os.pddb_change_pin(&modals) {
+                match pddb_os.pddb_change_pin() {
                     Ok(_) => modals.show_notification(t!("pddb.changepin.success", xous::LANG), None)
                                 .expect("couldn't show notification"),
                     Err(e) => {
@@ -1945,7 +1945,7 @@ fn wrapped_main() -> ! {
             }
             Opcode::ComputeBackupHashes => {
                 let mut buffer = unsafe { Buffer::from_memory_message_mut(msg.body.memory_message_mut().unwrap()) };
-                let result = pddb_os.checksums(Some(&modals));
+                let result = pddb_os.checksums();
                 buffer.replace(result).unwrap();
             }
             Opcode::Quit => {
@@ -2101,7 +2101,7 @@ fn try_mount_or_format(
                     fast = false;
                 }
 
-                pddb_os.pddb_format(fast, Some(&modals)).expect("couldn't format PDDB");
+                pddb_os.pddb_format(fast).expect("couldn't format PDDB");
 
                 // reset the RTC at the point of PDDB format. It is done now because at this point we know that
                 // no time offset keys can exist in the PDDB, and as a measure of good hygiene we want to restart
@@ -2136,7 +2136,7 @@ fn try_mount_or_format(
         }
         #[cfg(not(any(feature = "precursor", feature = "renode", feature="test-rekey")))]
         {
-            pddb_os.pddb_format(false, Some(&modals)).expect("couldn't format PDDB");
+            pddb_os.pddb_format(false).expect("couldn't format PDDB");
             let _ = xous::send_message(time_resetter,
                 xous::Message::new_blocking_scalar(
                     0, // the ID is "hard coded" using enumerated discriminants
@@ -2166,7 +2166,7 @@ fn try_mount_or_format(
 #[allow(dead_code)]
 pub(crate) fn manual_testcase(hw: &mut PddbOs) {
     log::info!("Initializing disk...");
-    hw.pddb_format(true, None).unwrap();
+    hw.pddb_format(true).unwrap();
     log::info!("Done initializing disk");
 
     // it's a vector because order is important: by default access to keys/dicts go into the latest entry first, and then recurse to the earliest

@@ -6,7 +6,6 @@ use aes_gcm_siv::{Nonce, Tag, Aes256GcmSiv};
 use aes_gcm_siv::aead::{Aead, Payload};
 use aes::{Aes256, Block, BLOCK_SIZE};
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
-use modals::Modals;
 use root_keys::api::KeywrapError;
 use root_keys::api::AesRootkeyType;
 use spinor::SPINOR_BULK_ERASE_SIZE;
@@ -60,6 +59,38 @@ const SCD_VERSION: u32 = 2;
 
 #[cfg(all(feature="pddbtest", feature="autobasis"))]
 pub const BASIS_TEST_ROOTNAME: &'static str = "test";
+
+// TODO This does not belong here, but who knows where it belongs, so for now I'm keeping it here.
+/// A connection to the client which uses this lib. In Precursor, that's the pddb
+/// server (TODO which might get renamed to pddb-ux).
+#[derive(Debug)]
+struct Client;
+
+// TODO It's not obvious what the _msg param should be. Probably the status updates should be
+// expressed via an enum. The parameter is a placeholder for now
+impl Client {
+    /// Send a status update.
+    fn status(&self, _msg: &str) {
+        // TODO This should send an async message
+        // TODO Possibly this should contain a 200ms delay to allow the UI to update, not sure
+        todo!()
+    }
+
+    fn approval(&self, _msg: &str) -> bool {
+        // TODO This should send a sync message and expect a bool return value
+        todo!()
+    }
+
+    fn prompt(&self, _msg: &str) -> std::result::Result<String, xous::Error> {
+        // TODO This should send a sync message and expect an optional string return value
+        todo!()
+    }
+
+    fn password(&self, _db_name: &str) -> BasisRequestPassword {
+        // TODO This should send a sync message and expect a BasisRequestPassword return value
+        todo!()
+    }
+}
 
 #[derive(Zeroize)]
 #[zeroize(drop)]
@@ -183,6 +214,7 @@ pub(crate) struct PddbOs {
     #[cfg(feature="perfcounter")]
     /// used to toggle performance profiling on or off
     use_perf: bool,
+    client: Client,
 }
 
 impl PddbOs {
@@ -257,6 +289,7 @@ impl PddbOs {
             pc_id,
             #[cfg(feature="perfcounter")]
             use_perf: true,
+            client: Client,
         };
         // emulated
         #[cfg(not(target_os = "xous"))]
@@ -286,6 +319,7 @@ impl PddbOs {
                 failed_logins: 0,
                 #[cfg(all(feature="pddbtest", feature="autobasis"))]
                 testnames: HashSet::new(),
+                client: Client,
             }
         };
         ret
@@ -774,9 +808,7 @@ impl PddbOs {
     fn syskey_ensure(&mut self) {
         while self.try_login() != PasswordState::Correct {
             self.clear_password(); // clear the bad password entry
-            let xns = xous_names::XousNames::new().unwrap();
-            let modals = modals::Modals::new(&xns).expect("can't connect to Modals server");
-            modals.show_notification(t!("pddb.badpass_infallible", xous::LANG), None).expect("notification failed");
+            self.client.status("incorrect password");
         }
     }
 
@@ -1746,7 +1778,7 @@ impl PddbOs {
         }
     }
 
-    fn pw_check(&self, modals: &modals::Modals) -> Result<()> {
+    fn pw_check(&self) -> Result<()> {
         let mut success = false;
         while !success {
             // the "same password check" is accomplished by just encrypting the all-zeros block twice
@@ -1758,7 +1790,7 @@ impl PddbOs {
 
             log::info!("{}PDDB.CHECKPASS,{}", xous::BOOKEND_START, xous::BOOKEND_END);
             #[cfg(any(feature="precursor", feature="renode"))] // skip this dialog in hosted mode
-            modals.show_notification(t!("pddb.checkpass", xous::LANG), None).expect("notification failed");
+            self.client.status("re-enter pin");
 
             self.clear_password();
             let mut checkblock_b = [0u8; BLOCK_SIZE];
@@ -1768,7 +1800,7 @@ impl PddbOs {
                 success = true;
             } else {
                 log::info!("{}PDDB.PWFAIL,{}", xous::BOOKEND_START, xous::BOOKEND_END);
-                modals.show_notification(t!("pddb.checkpass_fail", xous::LANG), None).expect("notification failed");
+                self.client.status("pin mismatch");
                 self.clear_password();
             }
         }
@@ -1780,13 +1812,11 @@ impl PddbOs {
     }
 
     /// this function attempts to change the PIN. returns Ok() if changed, error if not.
-    pub(crate) fn pddb_change_pin(&mut self, modals: &modals::Modals) -> Result<()> {
+    pub(crate) fn pddb_change_pin(&mut self) -> Result<()> {
         if let Some(system_keys) = &self.system_basis_key {
             // get the new password
             self.clear_password();
-            modals.show_notification(t!("pddb.changepin.enter_new_pin", xous::LANG), None)
-                .map_err(|_| Error::new(ErrorKind::Other, "Internal error"))?;
-            self.pw_check(modals)?;
+            self.pw_check()?;
 
             // wrap keys in the new password, and store them to disk
             let wrapped_key = self.rootkeys.wrap_key(&system_keys.data).expect("Internal error wrapping our encryption key");
@@ -1807,33 +1837,21 @@ impl PddbOs {
     /// in the PDDB an replace it with a brand-spanking new, blank PDDB.
     /// The number of servers that can connect to the Spinor crate is strictly tracked, so we borrow a reference
     /// to the Spinor object allocated to the PDDB implementation for this operation.
-    pub(crate) fn pddb_format(&mut self, fast: bool, progress: Option<&modals::Modals>) -> Result<()> {
+    pub(crate) fn pddb_format(&mut self, fast: bool) -> Result<()> {
         if !self.rootkeys.is_initialized().unwrap() {
             return Err(Error::new(ErrorKind::Unsupported, "Root keys are not initialized; cannot format a PDDB without root keys!"));
         }
-        // step 0. If we have a modal, confirm that the password entered was correct with a double-entry.
-        if let Some(modals) = progress {
-            self.pw_check(modals)?;
-        }
+        // step 0. Confirm that the password entered was correct with a double-entry.
+        self.pw_check()?;
 
         // step 1. Erase the entire PDDB region - leaves the state in all 1's
         if !fast {
             log::info!("Erasing the PDDB region");
-            if let Some(modals) = progress {
-                modals.start_progress(
-                    t!("pddb.erase", xous::LANG),
-                    xous::PDDB_LOC, xous::PDDB_LOC + PDDB_A_LEN as u32, xous::PDDB_LOC)
-                    .expect("couldn't raise progress bar");
-                // retain this delay, because the next section is so compute-intensive, it may take a
-                // while for the GAM to catch up.
-                self.tt.sleep_ms(100).unwrap();
-            }
+            self.client.status("starting pddb bulk erase");
             for offset in (xous::PDDB_LOC..(xous::PDDB_LOC + PDDB_A_LEN as u32)).step_by(SPINOR_BULK_ERASE_SIZE as usize) {
                 if (offset / SPINOR_BULK_ERASE_SIZE) % 4 == 0 {
                     log::info!("Initial erase: {}/{}", offset - xous::PDDB_LOC, PDDB_A_LEN as u32);
-                    if let Some(modals) = progress {
-                        modals.update_progress(offset as u32).expect("couldn't update progress bar");
-                    }
+                    self.client.status("erasing pddb progress offset as u32");
                 }
                 // do a blank check first to see if the sector really needs erasing
                 let mut blank = true;
@@ -1848,31 +1866,20 @@ impl PddbOs {
                     self.spinor.bulk_erase(offset, SPINOR_BULK_ERASE_SIZE).expect("couldn't erase memory");
                 }
             }
-            if let Some(modals) = progress {
-                modals.update_progress(xous::PDDB_LOC + PDDB_A_LEN as u32).expect("couldn't update progress bar");
-                modals.finish_progress().expect("couldn't dismiss progress bar");
-                #[cfg(feature="ux-swap-delay")]
-                self.tt.sleep_ms(100).unwrap();
-            }
+            self.client.status("pddb bulk erase complete");
         }
 
         // step 2. fill in the page table with junk, which marks it as cryptographically empty
-        if let Some(modals) = progress {
-            modals.start_progress(t!("pddb.initpt", xous::LANG), 0, size_of::<PageTableInFlash>() as u32, 0).expect("couldn't raise progress bar");
-        }
+        self.client.status("starting pddb page table init");
         let mut temp: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
         for page in (0..(size_of::<PageTableInFlash>() & !(PAGE_SIZE - 1))).step_by(PAGE_SIZE) {
             self.entropy.borrow_mut().get_slice(&mut temp);
             self.patch_pagetable_raw(&temp, page as u32);
-            if let Some(modals) = progress {
-                if (page / PAGE_SIZE) % 16 == 0 {
-                    modals.update_progress(page as u32).expect("couldn't update progress bar");
-                }
+            if (page / PAGE_SIZE) % 16 == 0 {
+                self.client.status("pddb page table init progress page as u32");
             }
         }
-        if let Some(modals) = progress {
-            modals.update_progress(size_of::<PageTableInFlash>() as u32).expect("couldn't update progress bar");
-        }
+        self.client.status("pddb page table init progress size_of::<PageTableInFlash>() as u32");
         if size_of::<PageTableInFlash>() & (PAGE_SIZE - 1) != 0 {
             let remainder_start = size_of::<PageTableInFlash>() & !(PAGE_SIZE - 1);
             log::info!("Page table does not end on a page boundary. Handling trailing page case of {} bytes", size_of::<PageTableInFlash>() - remainder_start);
@@ -1882,22 +1889,14 @@ impl PddbOs {
             }
             self.patch_pagetable_raw(&temp, remainder_start as u32);
         }
-        if let Some(modals) = progress {
-            modals.finish_progress().expect("couldn't dismiss progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("pddb page table init complete");
 
         // step 3. create our key material
         // consider: making ensure_aes_password() a pub-scoped function? let's see how this works in practice.
         //if !self.rootkeys.ensure_aes_password() {
         //    return Err(Error::new(ErrorKind::PermissionDenied, "unlock password was incorrect"));
         //}
-        if let Some(modals) = progress {
-            modals.start_progress(t!("pddb.key", xous::LANG), 0, 100, 0).expect("couldn't raise progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("starting pddb key generation");
         assert!(size_of::<StaticCryptoData>() == PAGE_SIZE, "StaticCryptoData structure is not correctly sized");
         let mut system_basis_key_pt: [u8; AES_KEYSIZE] = [0; AES_KEYSIZE];
         let mut system_basis_key: [u8; AES_KEYSIZE] = [0; AES_KEYSIZE];
@@ -1917,11 +1916,7 @@ impl PddbOs {
         ); // this causes system_basis_key to be owned by self and go out of scope
         let mut crypto_keys = StaticCryptoData::default();
         crypto_keys.version = SCD_VERSION; // should already be set by `default()` but let's be sure.
-        if let Some(modals) = progress {
-            modals.update_progress(50).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("halfway through pddb key generation");
         // copy the encrypted key into the data structure for commit to Flash
         // the wrapped key should have a well-defined length of 40 bytes
         assert!(wrapped_key.len() == 40, "wrapped key did not have the expected length");
@@ -1936,14 +1931,7 @@ impl PddbOs {
         self.entropy.borrow_mut().get_slice(&mut crypto_keys.salt_base);
         // commit keys
         self.patch_keys(crypto_keys.deref(), 0);
-        if let Some(modals) = progress {
-            modals.update_progress(100).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-            modals.finish_progress().expect("couldn't dismiss progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("pddb key generation complete");
         // now we have a copy of the AES key necessary to encrypt the default System basis that we created in step 2.
 
         #[cfg(not(target_os = "xous"))]
@@ -1955,10 +1943,7 @@ impl PddbOs {
         // step 5. fscb handling
         // pick a set of random pages from the free pool and assign it to the fscb
         // pass the generator an empty cache - this causes it to treat the entire disk as free space
-        if let Some(modals) = progress {
-            modals.start_progress(t!("pddb.fastspace", xous::LANG), 0, 100, 0).expect("couldn't raise progress bar");
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("starting pddb fast space init");
         let free_pool = self.fast_space_generate(BinaryHeap::<Reverse<u32>>::new());
         let mut fast_space = FastSpace {
             free_pool: [PhysPage(0); FASTSPACE_FREE_POOL_LEN],
@@ -1966,20 +1951,9 @@ impl PddbOs {
         for (&src, dst) in free_pool.iter().zip(fast_space.free_pool.iter_mut()) {
             *dst = src;
         }
-        if let Some(modals) = progress {
-            modals.update_progress(50).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("halfway through fast space init");
         self.fast_space_write(&fast_space);
-        if let Some(modals) = progress {
-            modals.update_progress(100).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-            modals.finish_progress().expect("couldn't dismiss progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("fast space init complete");
 
         #[cfg(not(target_os = "xous"))]
         self.tt.sleep_ms(500).unwrap();
@@ -1987,12 +1961,7 @@ impl PddbOs {
         // step 5. salt the free space with random numbers. this can take a while, we might need a "progress report" of some kind...
         // this is coded using "direct disk" offsets...under the assumption that we only ever really want to do this here, and
         // not re-use this routine elsewhere.
-        if let Some(modals) = progress {
-            modals.start_progress(t!("pddb.randomize", xous::LANG),
-            self.data_phys_base.as_u32(), PDDB_A_LEN as u32, self.data_phys_base.as_u32()).expect("couldn't raise progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("starting cryptographic wipe");
         let blank = [0xffu8; aes::BLOCK_SIZE];
         for offset in (self.data_phys_base.as_usize()..PDDB_A_LEN).step_by(PAGE_SIZE) {
             if fast {
@@ -2017,9 +1986,7 @@ impl PddbOs {
             self.entropy.borrow_mut().get_slice(&mut temp);
             if (offset / PAGE_SIZE) % 256 == 0 { // ~one update per megabyte
                 log::info!("Cryptographic 'erase': {}/{}", offset, PDDB_A_LEN);
-                if let Some(modals) = progress {
-                    modals.update_progress(offset as u32).expect("couldn't update progress bar");
-                }
+                self.client.status("cryptographic wipe progress offset as u32");
             }
             self.spinor.patch(
                 self.pddb_mr.as_slice(),
@@ -2028,21 +1995,10 @@ impl PddbOs {
                 offset as u32
             ).expect("couldn't fill in disk with random datax");
         }
-        if let Some(modals) = progress {
-            modals.update_progress(PDDB_A_LEN as u32).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-            modals.finish_progress().expect("couldn't dismiss progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("cryptographic wipe complete");
 
         // step 6. create the system basis root structure
-        if let Some(modals) = progress {
-            modals.start_progress(t!("pddb.structure", xous::LANG), 0, 100, 0).expect("couldn't raise progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("starting pddb structure init");
         let basis_root = BasisRoot {
             magic: api::PDDB_MAGIC,
             version: api::PDDB_VERSION,
@@ -2053,11 +2009,7 @@ impl PddbOs {
 
         // step 7. Create a hashmap for our reverse PTE, allocate sectors, and add it to the Pddb's cache
         self.fast_space_read(); // we reconstitute our fspace map even though it was just generated, partially as a sanity check that everything is ok
-        if let Some(modals) = progress {
-            modals.update_progress(33).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("pddb structure init 1/3 done");
 
         let mut basis_v2p_map = HashMap::<VirtAddr, PhysPage>::new();
         // allocate one page for the basis root
@@ -2089,11 +2041,7 @@ impl PddbOs {
         let syskey = self.system_basis_key.take().unwrap(); // take the key out
         self.data_encrypt_and_patch_page_with_commit(&syskey.data, &aad, &mut block, &pp);
         self.system_basis_key = Some(syskey); // put the key back
-        if let Some(modals) = progress {
-            modals.update_progress(66).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("pddb structure init 2/3 done");
 
         // step 9. generate & write initial page table entries
         for (&virt, phys) in basis_v2p_map.iter_mut() {
@@ -2101,14 +2049,7 @@ impl PddbOs {
             // mark the entry as clean, as it has been sync'd to disk
             phys.set_clean(true);
         }
-        if let Some(modals) = progress {
-            modals.update_progress(100).expect("couldn't update progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-            modals.finish_progress().expect("couldn't dismiss progress bar");
-            #[cfg(feature="ux-swap-delay")]
-            self.tt.sleep_ms(100).unwrap();
-        }
+        self.client.status("pddb structure init complete");
         Ok(())
     }
 
@@ -2195,16 +2136,12 @@ impl PddbOs {
 
         // 0. acquire all the keys
         if let Some(all_keys) = self.pddb_get_all_keys(&cache) {
-            // build a modals for rekey progress
-            let xns = xous_names::XousNames::new().unwrap();
-            let modals = modals::Modals::new(&xns).unwrap();
-
-            modals.start_progress(t!("pddb.rekey.keys", xous::LANG), 0, all_keys.len() as u32, 0).ok();
+            self.client.status("start generating encryption mappings");
             // we need a map of page numbers to encryption keys. The keys are referenced by their basis name.
             let mut pagemap = HashMap::<PhysAddr, &str>::new();
             // transform the returned Vec into a HashMap that maps basis names into pre-keyed ciphers.
             let mut keymap = HashMap::<&str, MigrationCiphers>::new();
-            for (index, (basis_keys, name)) in all_keys.iter().enumerate() {
+            for (_index, (basis_keys, name)) in all_keys.iter().enumerate() {
                 if let Some(map) = self.pt_scan_key(&basis_keys.pt, &basis_keys.data, &name) {
                     for pp in map.values() {
                         log::info!("page {} -> basis {}", pp.page_number(), name);
@@ -2222,7 +2159,7 @@ impl PddbOs {
                 self.dna_mode = DnaMode::Migration;
                 let aad_incoming = self.data_aad(&name);
                 keymap.insert(&name, MigrationCiphers { pt_ecb, data_gcm_siv, aad_incoming, aad_local, data_key: basis_keys.data.into() });
-                modals.update_progress(index as u32 + 1).ok();
+                self.client.status("encryption mappings progress index as u32 + 1");
             }
 
             // check that we have no pages in the FSCB that aren't already mapped in the
@@ -2240,7 +2177,7 @@ impl PddbOs {
                     }
                 }
             }
-            modals.finish_progress().ok();
+            self.client.status("done generating encryption mappings");
             if !clean {
                 return PddbRekeyOp::VerifyFail
             }
@@ -2257,7 +2194,7 @@ impl PddbOs {
             let pagetable: &[u8] = &self.pddb_mr.as_slice()[..pddb_data_pages * size_of::<Pte>()];
             log::info!("Derived page table of len 0x{:x}", pagetable.len());
             let entries_per_page = PAGE_SIZE / size_of::<Pte>();
-            modals.start_progress(t!("pddb.rekey.running", xous::LANG), 0, (pddb_data_pages * size_of::<Pte>()) as u32, 0).ok();
+            self.client.status("start rekeying");
             for (chunk_enum, page) in pagetable.chunks(PAGE_SIZE).enumerate() {
                 // this is the actual offset into pagetable[] that the page[] slice comes from
                 let chunk_start_address = chunk_enum * PAGE_SIZE;
@@ -2345,9 +2282,9 @@ impl PddbOs {
                 }
                 self.patch_pagetable_raw(&new_pt_page[..chunk_len], chunk_start_address as u32);
                 // this only updates once per page of PTEs, so, every 256 pages that get re-encrypted in the worst case.
-                modals.update_progress(chunk_start_address as u32).ok();
+                self.client.status("rekey progress chunk_start_address as u32");
             }
-            modals.finish_progress().ok();
+            self.client.status("done rekeying");
 
             self.dna_mode = DnaMode::Normal; // we're done with the legacy DNA!
 
@@ -2361,7 +2298,7 @@ impl PddbOs {
             };
             if do_fscb {
                 log::info!("regenerating fast space...");
-                modals.dynamic_notification(Some(t!("pddb.rekey.fastspace", xous::LANG)), None).ok();
+                self.client.status("regenerating fast space");
                 // convert our used page map into the structure needed by fast_space_generate()
                 let mut page_heap = BinaryHeap::new();
                 // drain doesn't actually de-allocate memory, but it gives us an opportunity
@@ -2386,7 +2323,7 @@ impl PddbOs {
                 self.fast_space_write(&fast_space);
                 // this will ensure the data cache is fully in sync
                 self.fast_space_read();
-                modals.dynamic_notification_close().ok();
+                self.client.status("fast space generation done");
                 log::info!("fast space generation done.");
             }
             PddbRekeyOp::Success
@@ -2431,15 +2368,11 @@ impl PddbOs {
 
         // 0. allow user to cancel out of the operation -- this will abort everything and cause the current
         //    alloc operation to fail
-        let xns = xous_names::XousNames::new().unwrap();
-        let modals = modals::Modals::new(&xns).unwrap();
-        modals.show_notification(
-            match self.dna_mode {
-                DnaMode::Normal => t!("pddb.freespace.request", xous::LANG),
-                DnaMode::Migration => t!("pddb.rekey.request", xous::LANG),
-                DnaMode::Churn => t!("pddb.churn.request", xous::LANG),
-            },
-            None).ok();
+        self.client.status(match self.dna_mode {
+            DnaMode::Normal => "more free space needed",
+            DnaMode::Migration => "pddb needs to be keyed to this device",
+            DnaMode::Churn => "pddb churn request",
+        });
         #[cfg(feature="ux-swap-delay")]
         self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
 
@@ -2449,29 +2382,19 @@ impl PddbOs {
             blist.push_str("\n");
             blist.push_str(name);
         }
-        modals.show_notification(&blist, None).ok();
+        self.client.status("currently enumerated bases list in blist");
         #[cfg(feature="ux-swap-delay")]
         self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
 
         // 1. prompt user to enter any name/password combos for other basis we want to keep
-        while self.yes_no_approval(&modals, t!("pddb.freespace.enumerate_another", xous::LANG)) {
+        while self.client.approval("enumerate another basis") {
             #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
 
-            match modals
-                .alert_builder(t!("pddb.freespace.name", xous::LANG))
-                .field(None, None)
-                .build()
+            match self.client.prompt("name of basis to enumerate")
             {
-                Ok(bname) => {
-                    let name = bname.first().as_str().to_string();
-                    let request = BasisRequestPassword {
-                        db_name: xous_ipc::String::from_str(name.to_string()),
-                        plaintext_pw: None,
-                    };
-                    let mut buf = Buffer::into_buf(request).unwrap();
-                    buf.lend_mut(self.pw_cid, PwManagerOpcode::RequestPassword.to_u32().unwrap()).unwrap();
-                    let retpass = buf.to_original::<BasisRequestPassword, _>().unwrap();
+                Ok(name) => {
+                    let retpass = self.client.password(&name);
                     // 2. validate the name/password combo
                     let basis_key = self.basis_derive_key(
                         &name,
@@ -2500,7 +2423,7 @@ impl PddbOs {
                     if let Some((basis_key, name)) = maybe_entry {
                         ret.push((basis_key, name));
                     } else {
-                        modals.show_notification(t!("pddb.freespace.badpass", xous::LANG), None).ok();
+                        self.client.status("bad password or basis does not exist");
                         #[cfg(feature="ux-swap-delay")]
                         self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
                     }
@@ -2515,40 +2438,19 @@ impl PddbOs {
                 blist.push_str("\n");
                 blist.push_str(name);
             }
-            modals.show_notification(&blist, None).ok();
+            self.client.status("current basis list in blist");
             #[cfg(feature="ux-swap-delay")]
             self.tt.sleep_ms(SWAP_DELAY_MS).unwrap();
         }
         // done!
-        if self.yes_no_approval(
-            &modals,
-            match self.dna_mode {
-                DnaMode::Normal => t!("pddb.freespace.finished", xous::LANG),
-                DnaMode::Migration => t!("pddb.rekey.finished", xous::LANG),
-                DnaMode::Churn => t!("pddb.churn.finished", xous::LANG),
+        if self.client.approval(match self.dna_mode {
+            DnaMode::Normal => "enumeration finished",
+            DnaMode::Migration => "rekey finished",
+            DnaMode::Churn => "churn finished",
         }) {
             Some(ret)
         } else {
             None
-        }
-    }
-
-    fn yes_no_approval(&self, modals: &modals::Modals, request: &str) -> bool {
-        modals.add_list(
-            vec![t!("pddb.yes", xous::LANG), t!("pddb.no", xous::LANG)]
-        ).expect("couldn't build confirmation dialog");
-        match modals.get_radiobutton(request) {
-            Ok(response) => {
-                if &response == t!("pddb.yes", xous::LANG) {
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => {
-                log::error!("get approval failed");
-                false
-            },
         }
     }
 
@@ -2630,17 +2532,10 @@ impl PddbOs {
         self.rootkeys.do_reset_dont_ask_init();
     }
 
-    pub(crate) fn checksums(&self, modals: Option::<&Modals>) -> root_keys::api::Checksums {
+    pub(crate) fn checksums(&self) -> root_keys::api::Checksums {
         let mut checksums = root_keys::api::Checksums::default();
         let pddb = self.pddb_mr.as_slice();
-        if let Some(m) = modals {
-            m.start_progress(
-                t!("pddb.checksums", xous::LANG),
-                0,
-                checksums.checksums.len() as u32,
-                0
-            ).ok();
-        }
+        self.client.status("computing checksums");
         for (index, region) in pddb.chunks(root_keys::api::CHECKSUM_BLOCKLEN_PAGE as usize * PAGE_SIZE).enumerate() {
             assert!(region.len() == root_keys::api::CHECKSUM_BLOCKLEN_PAGE as usize * PAGE_SIZE, "CHECKSUM_BLOCKLEN_PAGE is not an even divisor of the PDDB size");
             let mut hasher = Sha512Trunc256::new_with_strategy(FallbackStrategy::HardwareThenSoftware);
@@ -2648,13 +2543,9 @@ impl PddbOs {
             let digest = hasher.finalize();
             // copy only the first 128 bits of the hash into the checksum array
             checksums.checksums[index].copy_from_slice(&digest.as_slice()[..16]);
-            if let Some(m) = modals {
-                m.update_progress(index as u32).ok();
-            }
+            self.client.status("checksums progress index as u32");
         }
-        if let Some(m) = modals {
-            m.finish_progress().ok();
-        }
+        self.client.status("checksums done");
         checksums
     }
     //-------------------------------- TESTING -----------------------------------------
@@ -2971,11 +2862,6 @@ impl PddbOs {
 
         match self.rootkeys.unwrap_key(&scd.system_key, AES_KEYSIZE) {
             Ok(mut syskey) => {
-                // build a modals for migration messages
-                let xns = xous_names::XousNames::new().unwrap();
-                let modals = modals::Modals::new(&xns).unwrap();
-                // v1->v2 messages willl only be in English, because we don't have any non-English users yet (afaik)
-
                 let cipher_v1 = Aes256::new(GenericArray::from_slice(&syskey));
                 let mut system_key_v1: [u8; AES_KEYSIZE] = [0; AES_KEYSIZE];
                 for (&src, dst) in syskey.iter().zip(system_key_v1.iter_mut()) {
@@ -2986,7 +2872,7 @@ impl PddbOs {
                 for i in 0..syskey.len() {
                     unsafe{nuke.add(i).write_volatile(0)};
                 }
-                modals.dynamic_notification(Some("PDDB v1->v2 migration"), Some("Migrating System keys to v2")).unwrap();
+                self.client.status("migrating system keys to v2");
 
                 // ------ I. migrate the system basis -------
                 // *** 0. generate v2 keys. This will immediately overwrite the SCD -- if we have an error or power outage
@@ -3040,7 +2926,7 @@ impl PddbOs {
                 let mut used_pages = BinaryHeap::new();
 
                 // *** 1. scan the page table
-                modals.dynamic_notification_update(None, Some("Migrating System Basis")).unwrap();
+                self.client.status("migrating system basis");
                 // *** 2. if an entry matches, also decrypt the target page and store it here
                 // *** 3. re-encrypt the PTE and the target page to the v2 keys and corrected addressing scheme
                 if !self.migration_v1_to_v2_inner(
@@ -3061,94 +2947,78 @@ impl PddbOs {
                 // *** 4. The MBBB is natively migrated as part of this process, so nothing explictly needs to be done here.
 
                 // ------ II. migrate any hidden basis ------
-                modals.dynamic_notification_close().unwrap();
-                let mut prompt = String::from("Any secret Bases must be migrated now, or else their data will be lost.\n\nUnlock a Basis for migration?");
+                self.client.status("secret basis must be migrated");
                 loop {
-                    modals.add_list_item(t!("pddb.yes", xous::LANG)).expect("couldn't build radio item list");
-                    modals.add_list_item(t!("pddb.no", xous::LANG)).expect("couldn't build radio item list");
-                    match modals.get_radiobutton(&prompt) {
-                        Ok(response) => {
-                            if response.as_str() == t!("pddb.yes", xous::LANG) {
-                                match modals.alert_builder("Enter the Basis name")
-                                .field(Some("My Secret Basis".to_string()), None)
-                                .build() {
-                                    Ok(bname) => {
-                                        let request = BasisRequestPassword {
-                                            db_name: xous_ipc::String::from_str(bname.first().as_str()),
-                                            plaintext_pw: None,
-                                        };
-                                        let mut buf = Buffer::into_buf(request).unwrap();
-                                        buf.lend_mut(pw_cid, PwManagerOpcode::RequestPassword.to_u32().unwrap()).unwrap();
-                                        let ret = buf.to_original::<BasisRequestPassword, _>().unwrap();
-                                        if let Some(pw) = ret.plaintext_pw {
-                                            // derive old and new keys
-                                            let basis_key_v1 = self.basis_derive_key_v00_00_01_01(
-                                                bname.first().as_str(),
-                                                pw.as_str().unwrap_or("UTF8-error"),
-                                                &scd
-                                            );
-                                            let basis_aad_v1 = data_aad_v1(&self, bname.first().as_str());
-                                            let basis_aad_v2 = self.data_aad(bname.first().as_str());
-                                            let basis_pt_cipher_v1 = Aes256::new(GenericArray::from_slice(&basis_key_v1));
-                                            let basis_data_cipher_v1 = Aes256GcmSiv::new(Key::from_slice(&basis_key_v1));
-                                            let basis_keys = self.basis_derive_key(bname.first().as_str(), pw.as_str().unwrap_or("UTF8 error"));
-                                            let basis_pt_cipher_2 = Aes256::new(GenericArray::from_slice(&basis_keys.pt));
-                                            let basis_data_cipher_2 = Aes256GcmSiv::new(Key::from_slice(&basis_keys.data));
-                                            // perform the migration
-                                            if self.migration_v1_to_v2_inner(
-                                                &basis_aad_v1, &basis_aad_v2,
-                                                &basis_key_v1,
-                                                &basis_pt_cipher_v1,
-                                                &basis_data_cipher_v1,
-                                                &basis_keys.data,
-                                                &basis_pt_cipher_2,
-                                                &basis_data_cipher_2,
-                                                &mut used_pages,
-                                            ) {
-                                                #[cfg(not(target_os = "xous"))]
-                                                {
-                                                    let mut name = [0 as u8; 64];
-                                                    for (&src, dst) in bname.first().as_str().as_bytes().iter().zip(name.iter_mut()) {
-                                                        *dst = src;
-                                                    }
-                                                    export.push(
-                                                        KeyExport {
-                                                            basis_name: name,
-                                                            key: basis_keys.data,
-                                                            pt_key: basis_keys.pt,
-                                                        }
-                                                    );
-                                                }
-                                                prompt.clear();
-                                                prompt.push_str("Migration success, migrate another secret Basis?");
-                                            } else {
-                                                prompt.clear();
-                                                prompt.push_str("Migration failure, retry and/or migrate another secret Basis?");
+                    if self.client.approval("continue") {
+                        match self.client.prompt("basis name") {
+                            Ok(name) => {
+                                let ret = self.client.password(&name);
+                                if let Some(pw) = ret.plaintext_pw {
+                                    // derive old and new keys
+                                    let basis_key_v1 = self.basis_derive_key_v00_00_01_01(
+                                        bname.first().as_str(),
+                                        pw.as_str().unwrap_or("UTF8-error"),
+                                        &scd
+                                    );
+                                    let basis_aad_v1 = data_aad_v1(&self, bname.first().as_str());
+                                    let basis_aad_v2 = self.data_aad(bname.first().as_str());
+                                    let basis_pt_cipher_v1 = Aes256::new(GenericArray::from_slice(&basis_key_v1));
+                                    let basis_data_cipher_v1 = Aes256GcmSiv::new(Key::from_slice(&basis_key_v1));
+                                    let basis_keys = self.basis_derive_key(bname.first().as_str(), pw.as_str().unwrap_or("UTF8 error"));
+                                    let basis_pt_cipher_2 = Aes256::new(GenericArray::from_slice(&basis_keys.pt));
+                                    let basis_data_cipher_2 = Aes256GcmSiv::new(Key::from_slice(&basis_keys.data));
+                                    // perform the migration
+                                    if self.migration_v1_to_v2_inner(
+                                        &basis_aad_v1, &basis_aad_v2,
+                                        &basis_key_v1,
+                                        &basis_pt_cipher_v1,
+                                        &basis_data_cipher_v1,
+                                        &basis_keys.data,
+                                        &basis_pt_cipher_2,
+                                        &basis_data_cipher_2,
+                                        &mut used_pages,
+                                    ) {
+                                        #[cfg(not(target_os = "xous"))]
+                                        {
+                                            let mut name = [0 as u8; 64];
+                                            for (&src, dst) in bname.first().as_str().as_bytes().iter().zip(name.iter_mut()) {
+                                                *dst = src;
                                             }
-                                        } else {
-                                            log::warn!("Couldn't retrieve password for the basis, ignoring and moving on");
-                                            prompt.clear();
-                                            prompt.push_str("Error unlocking Basis, retry?");
+                                            export.push(
+                                                KeyExport {
+                                                    basis_name: name,
+                                                    key: basis_keys.data,
+                                                    pt_key: basis_keys.pt,
+                                                }
+                                            );
                                         }
-                                    }
-                                    Err(e) => {
-                                        log::warn!("error {:?} unlocking basis, aborting and moving on", e);
                                         prompt.clear();
-                                        prompt.push_str("Error unlocking Basis, retry?");
+                                        prompt.push_str("Migration success, migrate another secret Basis?");
+                                    } else {
+                                        prompt.clear();
+                                        prompt.push_str("Migration failure, retry and/or migrate another secret Basis?");
                                     }
+                                } else {
+                                    log::warn!("Couldn't retrieve password for the basis, ignoring and moving on");
+                                    prompt.clear();
+                                    prompt.push_str("Error unlocking Basis, retry?");
                                 }
-                            } else if response.as_str() == t!("pddb.no", xous::LANG) {
-                                break;
-                            } else {
-                                log::warn!("Got unexpected return from radiobutton: {}", response);
+                            }
+                            Err(e) => {
+                                log::warn!("error {:?} unlocking basis, aborting and moving on", e);
+                                prompt.clear();
+                                prompt.push_str("Error unlocking Basis, retry?");
                             }
                         }
-                        _ => log::warn!("get_radiobutton failed")
+                    } else if response.as_str() == t!("pddb.no", xous::LANG) {
+                        break;
+                    } else {
+                        log::warn!("Got unexpected return from radiobutton: {}", response);
                     }
                 }
 
                 // ------ III. nuke and regnerate fast space -----
-                modals.dynamic_notification(Some("Finalizing PDDB v1->v2 migration"), Some("Regenerate FastSpace")).unwrap();
+                self.client.status("migration: regenerate fast space");
                 let free_pool = self.fast_space_generate(used_pages);
                 let mut fast_space = FastSpace {
                     free_pool: [PhysPage(0); FASTSPACE_FREE_POOL_LEN],
@@ -3165,7 +3035,7 @@ impl PddbOs {
                 // this will ensure the data cache is fully in sync
                 self.fast_space_read();
 
-                modals.dynamic_notification_close().unwrap();
+                self.client.status("migration: done regenerating fast space");
 
                 // clear out the v1 key
                 let sk_ptr = system_key_v1.as_mut_ptr();
