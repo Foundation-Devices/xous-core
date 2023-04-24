@@ -368,10 +368,6 @@ mod api;
 use api::*;
 mod backend;
 use backend::*;
-mod ux;
-use ux::*;
-mod menu;
-use menu::*;
 
 mod libstd;
 
@@ -405,6 +401,39 @@ use rkyv::{
 };
 use core::mem::size_of;
 use core::ops::Deref;
+
+// TODO This probably does not belong here, but who knows where it belongs, so for now I'm putting it here.
+// TODO Also consider renaming this
+/// A connection to the client which uses pddb. In Precursor, that's the pddb
+/// server (TODO which might get renamed to pddb-ux).
+#[derive(Debug)]
+struct Client;
+
+// TODO It's not obvious what the _msg param should be. Probably the status updates should be
+// expressed via an enum. The parameter is a placeholder for now
+impl Client {
+    /// Send a status update.
+    fn status(&self, _msg: &str) {
+        // TODO This should send an async message
+        // TODO Possibly this should contain a 200ms delay to allow the UI to update, not sure
+        todo!()
+    }
+
+    fn approval(&self, _msg: &str) -> bool {
+        // TODO This should send a sync message and expect a bool return value
+        todo!()
+    }
+
+    fn prompt(&self, _msg: &str) -> std::result::Result<String, xous::Error> {
+        // TODO This should send a sync message and expect an optional string return value
+        todo!()
+    }
+
+    fn password(&self, _db_name: &str) -> BasisRequestPassword {
+        // TODO This should send a sync message and expect a BasisRequestPassword return value
+        todo!()
+    }
+}
 
 #[cfg(feature="perfcounter")]
 const FILE_ID_SERVICES_PDDB_SRC_MAIN: u32 = 0;
@@ -467,6 +496,8 @@ fn wrapped_main() -> ! {
     log::set_max_level(log::LevelFilter::Info);
     log::info!("my PID is {}", xous::process::id());
 
+    let client = Client;
+
     let xns = xous_names::XousNames::new().unwrap();
     let pddb_sid = xns.register_name(api::SERVER_NAME_PDDB, None).expect("can't register server");
     log::trace!("registered with NS -- {:?}", pddb_sid);
@@ -477,18 +508,8 @@ fn wrapped_main() -> ! {
     // for less-secured user prompts (everything but password entry)
     let modals = modals::Modals::new(&xns).expect("can't connect to Modals server");
 
-    // our very own password modal. Password modals are precious and privately owned, to avoid
-    // other processes from crafting them.
     let pw_sid = xous::create_server().expect("couldn't create a server for the password UX handler");
     let pw_cid = xous::connect(pw_sid).expect("couldn't connect to the password UX handler");
-    let pw_handle = thread::spawn({
-        move || {
-            password_ux_manager(
-                xous::connect(pddb_sid).unwrap(),
-                pw_sid
-            )
-        }
-    });
 
     // OS-specific PDDB driver
     let mut pddb_os = PddbOs::new(Rc::clone(&entropy), pw_cid);
@@ -528,15 +549,6 @@ fn wrapped_main() -> ! {
         }
     });
 
-    // our menu handler
-    let my_cid = xous::connect(pddb_sid).unwrap();
-    let _ = thread::spawn({
-        let my_cid = my_cid.clone();
-        move || {
-            pddb_menu(my_cid);
-        }
-    });
-
     // run the CI tests if the option has been selected
     #[cfg(all(
         not(target_os = "xous"),
@@ -549,9 +561,9 @@ fn wrapped_main() -> ! {
     }
 
     // a thread to trigger period scrubbing of the PDDB
+    let my_cid = xous::connect(pddb_sid).unwrap();
     let scrub_run = Arc::new(AtomicBool::new(false));
     let _ = thread::spawn({
-        let my_cid = my_cid.clone();
         let scrub_run = scrub_run.clone();
         move || {
             let tt = ticktimer_server::Ticktimer::new().unwrap();
@@ -827,13 +839,7 @@ fn wrapped_main() -> ! {
                 let mut mgmt = buffer.to_original::<PddbBasisRequest, _>().unwrap();
                 match mgmt.code {
                     PddbRequestCode::Create => {
-                        let request = BasisRequestPassword {
-                            db_name: mgmt.name,
-                            plaintext_pw: None,
-                        };
-                        let mut buf = Buffer::into_buf(request).unwrap();
-                        buf.lend_mut(pw_cid, PwManagerOpcode::RequestPassword.to_u32().unwrap()).unwrap();
-                        let ret = buf.to_original::<BasisRequestPassword, _>().unwrap();
+                        let ret = client.password(mgmt.name.as_str().unwrap());
                         if let Some(pw) = ret.plaintext_pw {
                             match basis_cache.basis_create(&mut pddb_os, mgmt.name.as_str().expect("name is not valid utf-8"), pw.as_str().expect("password was not valid utf-8")) {
                                 Ok(_) => {
@@ -864,13 +870,7 @@ fn wrapped_main() -> ! {
                     PddbRequestCode::Open => {
                         let mut finished = false;
                         while !finished {
-                            let request = BasisRequestPassword {
-                                db_name: mgmt.name,
-                                plaintext_pw: None,
-                            };
-                            let mut buf = Buffer::into_buf(request).unwrap();
-                            buf.lend_mut(pw_cid, PwManagerOpcode::RequestPassword.to_u32().unwrap()).unwrap();
-                            let ret = buf.to_original::<BasisRequestPassword, _>().unwrap();
+                            let ret = client.password(mgmt.name.as_str().unwrap());
                             if let Some(pw) = ret.plaintext_pw {
                                 if let Some(basis) = basis_cache.basis_unlock(
                                     &mut pddb_os, mgmt.name.as_str().expect("name is not valid utf-8"), pw.as_str().expect("password was not valid utf-8"),
@@ -1950,10 +1950,6 @@ fn wrapped_main() -> ! {
             }
             Opcode::Quit => {
                 log::warn!("quitting the PDDB server");
-                send_message(
-                    pw_cid,
-                    Message::new_blocking_scalar(PwManagerOpcode::Quit.to_usize().unwrap(), 0, 0, 0, 0)
-                ).unwrap();
                 xous::return_scalar(msg.sender, 0).unwrap();
                 break
             }
@@ -1968,7 +1964,6 @@ fn wrapped_main() -> ! {
     }
     // clean up our program
     log::trace!("main loop exit, destroying servers");
-    pw_handle.join().expect("password ux manager thread did not join as expected");
     xns.unregister_server(pddb_sid).unwrap();
     xous::destroy_server(pddb_sid).unwrap();
     log::trace!("quitting");

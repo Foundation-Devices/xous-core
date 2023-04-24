@@ -60,38 +60,6 @@ const SCD_VERSION: u32 = 2;
 #[cfg(all(feature="pddbtest", feature="autobasis"))]
 pub const BASIS_TEST_ROOTNAME: &'static str = "test";
 
-// TODO This does not belong here, but who knows where it belongs, so for now I'm keeping it here.
-/// A connection to the client which uses this lib. In Precursor, that's the pddb
-/// server (TODO which might get renamed to pddb-ux).
-#[derive(Debug)]
-struct Client;
-
-// TODO It's not obvious what the _msg param should be. Probably the status updates should be
-// expressed via an enum. The parameter is a placeholder for now
-impl Client {
-    /// Send a status update.
-    fn status(&self, _msg: &str) {
-        // TODO This should send an async message
-        // TODO Possibly this should contain a 200ms delay to allow the UI to update, not sure
-        todo!()
-    }
-
-    fn approval(&self, _msg: &str) -> bool {
-        // TODO This should send a sync message and expect a bool return value
-        todo!()
-    }
-
-    fn prompt(&self, _msg: &str) -> std::result::Result<String, xous::Error> {
-        // TODO This should send a sync message and expect an optional string return value
-        todo!()
-    }
-
-    fn password(&self, _db_name: &str) -> BasisRequestPassword {
-        // TODO This should send a sync message and expect a BasisRequestPassword return value
-        todo!()
-    }
-}
-
 #[derive(Zeroize)]
 #[zeroize(drop)]
 #[repr(C)] // this can map directly into Flash
